@@ -11,6 +11,9 @@ const api = {
   setConfig: (patch: Record<string, unknown>) => ipcRenderer.invoke('config:set', patch),
 
   listDocs: () => ipcRenderer.invoke('vault:list'),
+  listFolders: () => ipcRenderer.invoke('vault:folders'),
+  makeFolder: (payload: { parent?: string; name: string }) => ipcRenderer.invoke('vault:mkdir', payload),
+  moveDoc: (rel: string, targetDir: string) => ipcRenderer.invoke('doc:move', rel, targetDir),
   pickVault: () => ipcRenderer.invoke('vault:pick'),
   vaultPath: () => ipcRenderer.invoke('vault:path'),
   readDoc: (rel: string) => ipcRenderer.invoke('doc:read', rel),
@@ -47,6 +50,8 @@ const api = {
 
   hide: () => ipcRenderer.invoke('window:hide'),
   pin: (on: boolean) => ipcRenderer.invoke('window:pin', on),
+  toggleMaximize: () => ipcRenderer.invoke('window:maximize'),
+  isMaximized: () => ipcRenderer.invoke('window:isMaximized'),
   quit: () => ipcRenderer.invoke('app:quit'),
   version: () => ipcRenderer.invoke('app:version'),
   openVault: () => ipcRenderer.invoke('app:openVault'),
@@ -56,6 +61,7 @@ const api = {
   onVaultChanged: (cb: (docs: any[]) => void) => on('vault:changed', cb),
   onConfigChanged: (cb: (cfg: any) => void) => on('config:changed', cb),
   onWindowShown: (cb: () => void) => on('window:shown', cb),
+  onMaximized: (cb: (on: boolean) => void) => on('window:maximized', cb),
   onOpenSettings: (cb: () => void) => on('ui:open-settings', cb),
   onThemeSystem: (cb: (dark: boolean) => void) => on('theme:system', cb),
 
@@ -63,7 +69,16 @@ const api = {
   aiOnDone: (cb: (data: { reqId: string; text: string; reasoning: string; usage?: { prompt: number; completion: number } }) => void) =>
     on('ai:done', cb),
   aiOnError: (cb: (data: { reqId: string; message: string }) => void) => on('ai:error', cb),
-  aiOnAborted: (cb: (data: { reqId: string }) => void) => on('ai:aborted', cb)
+  aiOnAborted: (cb: (data: { reqId: string }) => void) => on('ai:aborted', cb),
+  aiOnTool: (
+    cb: (data: {
+      reqId: string
+      name: string
+      args?: string
+      status: 'running' | 'done' | 'unsupported'
+      preview?: string
+    }) => void
+  ) => on('ai:tool', cb)
 }
 
 contextBridge.exposeInMainWorld('api', api)

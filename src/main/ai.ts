@@ -45,6 +45,8 @@ interface ChatRequest {
   messages: { role: 'system' | 'user' | 'assistant'; content: string }[]
   temperature?: number
   maxTokens?: number
+  /** 允许模型调用本地笔记库工具（list_docs / read_doc / search_docs） */
+  tools?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -132,7 +134,7 @@ function describeError(err: unknown): string {
 const running = new Map<string, AbortController>()
 const FLUSH_MS = 45
 
-function makeEmitter(reqId: string, send: (channel: string, payload: unknown) => void) {
+function makeEmitter(reqId: string, send: (channel: string, payload: unknown) => void, base = '') {
   let text = ''
   let reasoning = ''
   let dirty = false
@@ -141,7 +143,7 @@ function makeEmitter(reqId: string, send: (channel: string, payload: unknown) =>
   const flush = () => {
     if (!dirty) return
     dirty = false
-    send('ai:stream', { reqId, text, reasoning })
+    send('ai:stream', { reqId, text: base + text, reasoning })
   }
 
   return {
@@ -175,24 +177,137 @@ function makeEmitter(reqId: string, send: (channel: string, payload: unknown) =>
   }
 }
 
-async function streamChat(
+// ---------------------------------------------------------------------------
+// 本地笔记库工具（function calling）
+// ---------------------------------------------------------------------------
+export interface VaultAccess {
+  list(): Promise<{ path: string; title: string; size: number }[]>
+  read(path: string): Promise<string>
+  search(query: string): Promise<{ path: string; title: string; hits: { line: number; text: string }[] }[]>
+}
+
+interface ToolCall {
+  id: string
+  type: 'function'
+  function: { name: string; arguments: string }
+}
+
+const VAULT_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'list_docs',
+      description:
+        '列出笔记库里的文档（相对路径、标题、字符数）。需要知道有哪些文档、或确认某个文档的准确路径时调用。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '可选关键词，按标题或路径过滤，留空则返回全部' }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_doc',
+      description:
+        '读取指定文档的完整 Markdown 内容。path 必须来自 <library> 清单、用户给出的路径或 list_docs 的返回，不能自己拼。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '文档相对路径，例如「排查/502 网关超时.md」' }
+        },
+        required: ['path']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_docs',
+      description: '在笔记库全文中检索关键词，返回命中的文档、行号和原文片段。用于找「哪篇笔记提过这个报错」。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '要检索的关键词或报错原文' }
+        },
+        required: ['query']
+      }
+    }
+  }
+]
+
+const MAX_TOOL_ROUNDS = 4
+const TOOL_OUTPUT_LIMIT = 14000
+
+async function execTool(vault: VaultAccess, name: string, rawArgs: string): Promise<string> {
+  let args: Record<string, unknown> = {}
+  try {
+    args = rawArgs?.trim() ? JSON.parse(rawArgs) : {}
+  } catch {
+    return '工具参数不是合法 JSON，请重新调用并只传 JSON 对象'
+  }
+  try {
+    if (name === 'list_docs') {
+      const all = await vault.list()
+      const q = String(args.query || '').trim().toLowerCase()
+      const list = q
+        ? all.filter((d) => d.title.toLowerCase().includes(q) || d.path.toLowerCase().includes(q))
+        : all
+      if (!list.length) return '没有匹配的文档'
+      return list
+        .slice(0, 150)
+        .map((d) => `- ${d.path} （${d.title}，${d.size} 字符）`)
+        .join('\n')
+    }
+    if (name === 'read_doc') {
+      const p = String(args.path || '').trim().replace(/^\.?\//, '')
+      if (!p) return '缺少 path 参数'
+      const text = await vault.read(p)
+      return text.length > TOOL_OUTPUT_LIMIT
+        ? `${text.slice(0, TOOL_OUTPUT_LIMIT)}\n\n…（内容过长已截断，共 ${text.length} 字符）`
+        : text
+    }
+    if (name === 'search_docs') {
+      const q = String(args.query || '').trim()
+      if (!q) return '缺少 query 参数'
+      const hits = await vault.search(q)
+      if (!hits.length) return `笔记库里没有找到包含「${q}」的内容`
+      return hits
+        .slice(0, 8)
+        .map((h) => `${h.path}\n${h.hits.map((x) => `  第${x.line}行: ${x.text}`).join('\n')}`)
+        .join('\n\n')
+    }
+    return `未知工具：${name}`
+  } catch (err) {
+    return `读取失败：${(err as Error)?.message || '未知错误'}`
+  }
+}
+
+interface StreamResult {
+  text: string
+  reasoning: string
+  toolCalls: ToolCall[]
+  usage?: { prompt: number; completion: number }
+}
+
+async function streamOnce(
   profile: ModelProfile,
-  payload: ChatRequest,
+  messages: any[],
+  opts: { withTools: boolean; reqId: string; base: string; temperature?: number; maxTokens?: number },
   controller: AbortController,
   send: (channel: string, payload: unknown) => void
-) {
-  const messages = [
-    ...(payload.system ? [{ role: 'system' as const, content: payload.system }] : []),
-    ...payload.messages
-  ]
-
-  const buildBody = (withUsage: boolean) => ({
+): Promise<StreamResult> {
+  const buildBody = (withUsage: boolean, withTools: boolean) => ({
     model: profile.model,
     messages,
     stream: true,
-    temperature: payload.temperature ?? profile.temperature ?? 0.3,
-    max_tokens: payload.maxTokens ?? profile.maxTokens ?? 4000,
-    ...(withUsage ? { stream_options: { include_usage: true } } : {})
+    temperature: opts.temperature ?? profile.temperature ?? 0.3,
+    max_tokens: opts.maxTokens ?? profile.maxTokens ?? 4000,
+    ...(withUsage ? { stream_options: { include_usage: true } } : {}),
+    ...(withTools ? { tools: VAULT_TOOLS, tool_choice: 'auto' } : {})
   })
 
   let extra: Record<string, string> = {}
@@ -211,24 +326,35 @@ async function streamChat(
   }
   if (profile.apiKey?.trim()) headers.Authorization = `Bearer ${profile.apiKey.trim()}`
 
+  let withUsage = true
+  let withTools = opts.withTools
   let res = await fetch(endpoint(profile.baseUrl), {
     method: 'POST',
     headers,
-    body: JSON.stringify(buildBody(true)),
+    body: JSON.stringify(buildBody(withUsage, withTools)),
     signal: controller.signal
   })
 
-  // 部分兼容实现不认 stream_options，去掉再试一次
-  if (!res.ok && res.status === 400) {
+  // 兼容性降级：不认 stream_options 的去掉用量统计；
+  // 不支持 tools 的（部分小模型 / 转发层）去掉工具，退化为纯对话。
+  let downgrades = 0
+  while (!res.ok && res.status === 400 && downgrades < 2) {
     const raw = await res.clone().text().catch(() => '')
-    if (/stream_options/i.test(raw)) {
-      res = await fetch(endpoint(profile.baseUrl), {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(buildBody(false)),
-        signal: controller.signal
-      })
+    if (withUsage && /stream_options/i.test(raw)) {
+      withUsage = false
+    } else if (withTools && /tool|function|parallel/i.test(raw)) {
+      withTools = false
+      send('ai:tool', { reqId: opts.reqId, name: '', status: 'unsupported' })
+    } else {
+      break
     }
+    downgrades++
+    res = await fetch(endpoint(profile.baseUrl), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(buildBody(withUsage, withTools)),
+      signal: controller.signal
+    })
   }
 
   if (!res.ok) {
@@ -241,25 +367,33 @@ async function streamChat(
   const contentType = res.headers.get('content-type') || ''
   if (contentType.includes('application/json')) {
     const data: any = await res.json().catch(() => null)
-    const text = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? ''
-    if (!text) throw new Error('模型没有返回内容')
-    send('ai:stream', { reqId: payload.reqId, text, reasoning: '' })
-    send('ai:done', {
-      reqId: payload.reqId,
+    const message = data?.choices?.[0]?.message
+    const text: string = message?.content ?? data?.choices?.[0]?.text ?? ''
+    const calls: ToolCall[] = Array.isArray(message?.tool_calls)
+      ? message.tool_calls.map((c: any, i: number) => ({
+          id: c.id || `call_${i}`,
+          type: 'function' as const,
+          function: { name: c.function?.name || '', arguments: c.function?.arguments || '{}' }
+        }))
+      : []
+    if (!text && !calls.length) throw new Error('模型没有返回内容')
+    send('ai:stream', { reqId: opts.reqId, text: opts.base + text, reasoning: '' })
+    return {
       text,
       reasoning: '',
+      toolCalls: calls,
       usage: data?.usage
         ? { prompt: data.usage.prompt_tokens ?? 0, completion: data.usage.completion_tokens ?? 0 }
         : undefined
-    })
-    return
+    }
   }
 
-  const emitter = makeEmitter(payload.reqId, send)
+  const emitter = makeEmitter(opts.reqId, send, opts.base)
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
   let usage: { prompt: number; completion: number } | undefined
+  const calls: ToolCall[] = []
 
   while (true) {
     const { done, value } = await reader.read()
@@ -293,16 +427,105 @@ async function streamChat(
       if (delta) {
         const reason = delta.reasoning_content ?? delta.reasoning ?? ''
         emitter.push(typeof delta.content === 'string' ? delta.content : '', typeof reason === 'string' ? reason : '')
+        // 工具调用是增量下发的：按 index 聚合函数名与参数片段
+        if (Array.isArray(delta.tool_calls)) {
+          for (const part of delta.tool_calls) {
+            const i = typeof part.index === 'number' ? part.index : calls.length
+            if (!calls[i]) calls[i] = { id: '', type: 'function', function: { name: '', arguments: '' } }
+            if (part.id) calls[i].id = part.id
+            if (part.function?.name) calls[i].function.name += part.function.name
+            if (part.function?.arguments) calls[i].function.arguments += part.function.arguments
+          }
+        }
       }
       if (chunk.error) throw new Error(chunk.error.message || '服务端返回错误')
     }
   }
 
   const final = emitter.finish()
-  if (!final.text.trim() && !final.reasoning.trim()) {
+  const validCalls = calls.filter((c) => c && c.function?.name)
+  validCalls.forEach((c, i) => {
+    if (!c.id) c.id = `call_${Date.now().toString(36)}_${i}`
+  })
+  if (!final.text.trim() && !final.reasoning.trim() && !validCalls.length) {
     throw new Error('模型没有返回内容')
   }
-  send('ai:done', { reqId: payload.reqId, text: final.text, reasoning: final.reasoning, usage })
+  return { text: final.text, reasoning: final.reasoning, toolCalls: validCalls, usage }
+}
+
+// ---------------------------------------------------------------------------
+// 多轮：模型可以请求读文档，读完再继续回答
+// ---------------------------------------------------------------------------
+async function runChat(
+  profile: ModelProfile,
+  payload: ChatRequest,
+  controller: AbortController,
+  send: (channel: string, payload: unknown) => void,
+  vault: VaultAccess | null
+) {
+  const messages: any[] = [
+    ...(payload.system ? [{ role: 'system', content: payload.system }] : []),
+    ...payload.messages
+  ]
+  const withTools = !!payload.tools && !!vault
+  let acc = ''
+  let accReason = ''
+  let usage: { prompt: number; completion: number } | undefined
+
+  for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+    const r = await streamOnce(
+      profile,
+      messages,
+      {
+        withTools,
+        reqId: payload.reqId,
+        base: acc,
+        temperature: payload.temperature,
+        maxTokens: payload.maxTokens
+      },
+      controller,
+      send
+    )
+    if (r.usage) usage = r.usage
+    if (r.reasoning) accReason = accReason ? `${accReason}\n${r.reasoning}` : r.reasoning
+    acc += r.text
+
+    const wantsTools = withTools && r.toolCalls.length > 0 && round < MAX_TOOL_ROUNDS
+    if (!wantsTools || !vault) {
+      if (!acc.trim() && !accReason.trim()) {
+        acc = r.toolCalls.length
+          ? '模型反复请求读取文档但没有给出结论。可以换个问法，或减少上下文文档后重试。'
+          : ''
+        if (!acc) throw new Error('模型没有返回内容')
+      }
+      send('ai:done', { reqId: payload.reqId, text: acc, reasoning: accReason, usage })
+      return
+    }
+
+    messages.push({
+      role: 'assistant',
+      content: r.text || null,
+      tool_calls: r.toolCalls.map((c) => ({ id: c.id, type: 'function', function: c.function }))
+    })
+
+    for (const call of r.toolCalls) {
+      send('ai:tool', {
+        reqId: payload.reqId,
+        name: call.function.name,
+        args: call.function.arguments,
+        status: 'running'
+      })
+      const out = await execTool(vault, call.function.name, call.function.arguments)
+      messages.push({ role: 'tool', tool_call_id: call.id, content: out })
+      send('ai:tool', {
+        reqId: payload.reqId,
+        name: call.function.name,
+        args: call.function.arguments,
+        status: 'done',
+        preview: out.slice(0, 120)
+      })
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +577,11 @@ async function once(
 // ---------------------------------------------------------------------------
 // 注册 IPC
 // ---------------------------------------------------------------------------
-export function registerAi(userDir: string, getWindow: () => BrowserWindow | null) {
+export function registerAi(
+  userDir: string,
+  getWindow: () => BrowserWindow | null,
+  getVault?: () => VaultAccess
+) {
   USER_DIR = userDir
   MODELS_FILE = join(USER_DIR, 'models.json')
   SESSIONS_FILE = join(USER_DIR, 'sessions.json')
@@ -409,7 +636,7 @@ export function registerAi(userDir: string, getWindow: () => BrowserWindow | nul
     const controller = new AbortController()
     running.set(payload.reqId, controller)
 
-    streamChat(profile, payload, controller, send)
+    runChat(profile, payload, controller, send, getVault ? getVault() : null)
       .catch((err) => {
         if ((err as { name?: string })?.name === 'AbortError') {
           send('ai:aborted', { reqId: payload.reqId })

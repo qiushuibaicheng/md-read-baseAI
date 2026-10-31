@@ -36,7 +36,14 @@ const FALLBACK: AppConfig = {
 
 function mergeDocs(prev: DocMeta[], next: DocMeta[]): DocMeta[] {
   const map = new Map(next.map((d) => [d.path, d]))
-  const kept = prev.filter((d) => map.has(d.path)).map((d) => map.get(d.path)!)
+  const seen = new Set<string>()
+  const kept = prev
+    .filter((d) => {
+      if (!map.has(d.path) || seen.has(d.path)) return false
+      seen.add(d.path)
+      return true
+    })
+    .map((d) => map.get(d.path)!)
   const added = next.filter((d) => !prev.some((p) => p.path === d.path))
   return [...added, ...kept]
 }
@@ -50,10 +57,50 @@ function fileToDataUrl(file: File): Promise<string> {
   })
 }
 
+/** 块级内容的开头：标题、列表、引用、表格、代码块、图片、HTML 标签 */
+const BLOCK_HEAD = /^(#{1,6}\s|[-*+]\s|\d+[.)]\s|>|\||```|~~~|!\[|<[a-zA-Z]|:::)/
+
+const lineAt = (text: string, index: number) => text.slice(0, Math.max(0, index)).split('\n').length
+
+/**
+ * 把 text 插到 [start, end) 位置。
+ * 块级内容（多行 / 标题 / 列表…）自动补空行，避免和上下文粘在一起；
+ * 行内内容（如 Tab 的两个空格）原样插入，不做任何修饰。
+ */
+function composeInsert(
+  value: string,
+  start: number,
+  end: number,
+  text: string,
+  block: boolean
+): { text: string; caret: number } {
+  if (start !== end) {
+    // 有选区：直接替换，尊重用户的选择
+    return { text: value.slice(0, start) + text + value.slice(end), caret: start + text.length }
+  }
+  let lead = ''
+  let tail = ''
+  if (block) {
+    const before = value.slice(0, start)
+    const after = value.slice(end)
+    if (before && !before.endsWith('\n')) lead = '\n\n'
+    else if (before && !before.endsWith('\n\n')) lead = '\n'
+    if (after) {
+      if (!after.startsWith('\n')) tail = '\n\n'
+      else if (!after.startsWith('\n\n')) tail = '\n'
+    }
+  }
+  return {
+    text: value.slice(0, start) + lead + text + tail + value.slice(end),
+    caret: start + lead.length + text.length
+  }
+}
+
 export default function App() {
   const [ready, setReady] = useState(false)
   const [config, setConfig] = useState<AppConfig>(FALLBACK)
   const [docs, setDocs] = useState<DocMeta[]>([])
+  const [folders, setFolders] = useState<string[]>([])
   const [snippets, setSnippets] = useState<Snippet[]>([])
   const [clips, setClips] = useState<ClipItem[]>([])
   const [models, setModels] = useState<ModelProfile[]>([])
@@ -81,12 +128,15 @@ export default function App() {
   const [dragging, setDragging] = useState(false)
   const [dropping, setDropping] = useState(false)
   const [entering, setEntering] = useState(true)
+  const [maximized, setMaximized] = useState(false)
   const [selection, setSelection] = useState<{ text: string; x: number; y: number } | null>(null)
   const [diff, setDiff] = useState<{ before: string; after: string; title: string } | null>(null)
   const [undo, setUndo] = useState<{ path: string; content: string; at: number } | null>(null)
 
   const editorRef = useRef<HTMLTextAreaElement | null>(null)
   const panesRef = useRef<HTMLDivElement | null>(null)
+  /** 最后一次已知的插入点：切到 AI 面板后 textarea 失焦，但位置要留住 */
+  const caretRef = useRef<{ path: string; start: number; end: number } | null>(null)
   const saveTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
   const pending = useRef<Record<string, string>>({})
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -96,11 +146,16 @@ export default function App() {
 
   const theme: 'light' | 'dark' = config.themeMode === 'system' ? (systemDark ? 'dark' : 'light') : config.themeMode
 
+  useEffect(() => {
+    window.api.isMaximized().then(setMaximized)
+  }, [])
+
   // ---------------------------------------------------------------- 初始化
   useEffect(() => {
     window.api.init().then((res) => {
       setConfig(res.config)
       setDocs(res.docs)
+      window.api.listFolders().then(setFolders).catch(() => undefined)
       setSnippets(res.snippets)
       setClips(res.clipboard)
       setHotkeyActive(res.hotkeyActive)
@@ -136,7 +191,8 @@ export default function App() {
         setTimeout(() => setEntering(false), 280)
         setTimeout(() => editorRef.current?.focus(), 60)
       }),
-      window.api.onOpenSettings(() => setSettingsOpen(true))
+      window.api.onOpenSettings(() => setSettingsOpen(true)),
+      window.api.onMaximized(setMaximized)
     ]
     return () => offs.forEach((off) => off())
   }, [])
@@ -235,8 +291,9 @@ export default function App() {
     })
   }
 
-  const createDoc = async () => {
-    const rel = await window.api.createDoc({})
+  const createDoc = async (dirOrEvent?: unknown) => {
+    const dir = typeof dirOrEvent === 'string' ? dirOrEvent : undefined
+    const rel = await window.api.createDoc(dir ? { dir } : {})
     const list = await window.api.listDocs()
     setDocs(list)
     openDoc(rel)
@@ -247,6 +304,19 @@ export default function App() {
       const end = ta.value.indexOf('\n')
       ta.setSelectionRange(2, end > 0 ? end : ta.value.length)
     }, 180)
+  }
+
+  const createFolder = async (parent: string | undefined, name: string) => {
+    try {
+      await window.api.makeFolder({ parent, name })
+      setFolders(await window.api.listFolders())
+      setDocs(await window.api.listDocs())
+      showToast(`已创建文件夹「${name}」`)
+      return true
+    } catch (err) {
+      showToast(String((err as Error)?.message || err).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''))
+      return false
+    }
   }
 
   const deleteDoc = async (path: string) => {
@@ -402,24 +472,97 @@ export default function App() {
     showToast('已应用 AI 修改 · Ctrl+Z 撤回')
   }
 
-  const insertText = (text: string) => {
+  /** 追加到文末 */
+  const appendText = (raw: string) => {
     if (!active) {
       showToast('先打开一篇文档')
       return
     }
+    const text = raw.replace(/\r\n/g, '\n').trim()
+    if (!text) return
+    const value = contents[active] ?? ''
+    const sep = !value ? '' : value.endsWith('\n\n') ? '' : value.endsWith('\n') ? '\n' : '\n\n'
+    const next = value + sep + text
+    handleChange(next)
+    caretRef.current = { path: active, start: next.length, end: next.length }
+    showToast('已追加到文末')
+  }
+
+  /** 记住光标：点击、拖选、键盘移动都要更新 */
+  const rememberCaret = () => {
     const ta = editorRef.current
-    if (!ta) {
-      const value = contents[active] ?? ''
-      handleChange(value + (value.endsWith('\n') ? '' : '\n') + text)
-      showToast('已追加到文末')
+    if (!ta || !active) return
+    caretRef.current = { path: active, start: ta.selectionStart, end: ta.selectionEnd }
+  }
+
+  /**
+   * 插入到光标处。位置来源优先级：
+   * ① 记忆中的插入点（AI 面板抢了焦点也还在）② 当前聚焦的编辑器 ③ 兜底追加到文末
+   */
+  const insertAtCaret = (raw: string) => {
+    if (!active) {
+      showToast('先打开一篇文档')
+      return
+    }
+    const text = raw.replace(/\r\n/g, '\n').replace(/^\n+/, '').replace(/\s+$/, '')
+    if (!text) return
+    const value = contents[active] ?? ''
+    // 多行、块级语法、或者一长段（>80 字）都按块处理，避免和上下文粘成一段
+    const block = /\n/.test(text) || BLOCK_HEAD.test(text) || text.length > 80
+
+    const ta = editorRef.current
+    const memo = caretRef.current
+    let point: { start: number; end: number } | null = null
+    if (memo && memo.path === active) {
+      const start = Math.min(memo.start, value.length)
+      point = { start, end: Math.min(Math.max(memo.end, start), value.length) }
+    } else if (ta && document.activeElement === ta) {
+      point = { start: ta.selectionStart, end: ta.selectionEnd }
+    }
+
+    if (!point) {
+      const sep = !value ? '' : value.endsWith('\n\n') ? '' : value.endsWith('\n') ? '\n' : '\n\n'
+      handleChange(value + sep + text)
+      showToast('已追加到文末 · 在正文点一下可指定插入位置')
+      return
+    }
+
+    const next = composeInsert(value, point.start, point.end, text, block)
+    handleChange(next.text)
+    caretRef.current = { path: active, start: next.caret, end: next.caret }
+    const line = lineAt(next.text, next.caret)
+    requestAnimationFrame(() => {
+      const el = editorRef.current
+      if (!el) {
+        showToast(`已插入到第 ${line} 行`)
+        return
+      }
+      el.focus()
+      el.setSelectionRange(next.caret, next.caret)
+      // 让插入点滚进视野
+      const lh = parseFloat(getComputedStyle(el).lineHeight) || 24
+      const y = (el.value.slice(0, next.caret).split('\n').length - 1) * lh
+      if (y < el.scrollTop + lh || y > el.scrollTop + el.clientHeight - lh * 2) {
+        el.scrollTop = Math.max(0, y - el.clientHeight / 2)
+      }
+      showToast(`已插入到第 ${line} 行`)
+    })
+  }
+
+  /** 编辑器内直接插入（Tab 缩进、粘贴图片），光标就在眼前，不做兜底提示 */
+  const insertAtCursor = (text: string) => {
+    const ta = editorRef.current
+    if (!ta || !active) {
+      insertAtCaret(text)
       return
     }
     const value = contents[active] ?? ''
-    const start = ta.selectionStart
-    const end = ta.selectionEnd
-    handleChange(value.slice(0, start) + text + value.slice(end))
+    const block = /\n/.test(text) && text.trim().length > 0
+    const next = composeInsert(value, ta.selectionStart, ta.selectionEnd, text, block)
+    handleChange(next.text)
+    caretRef.current = { path: active, start: next.caret, end: next.caret }
     requestAnimationFrame(() => {
-      ta.selectionStart = ta.selectionEnd = start + text.length
+      ta.selectionStart = ta.selectionEnd = next.caret
       ta.focus()
     })
   }
@@ -544,23 +687,6 @@ export default function App() {
   }, [active, mode, searchOpen, settingsOpen, outlineOpen, snippets, flushSave, selection, modelsOpen, diff, undo])
 
   // ---------------------------------------------------------------- 编辑交互
-  const insertAtCursor = (text: string) => {
-    const ta = editorRef.current
-    if (!ta || !active) {
-      insertText(text)
-      return
-    }
-    const value = contents[active] ?? ''
-    const start = ta.selectionStart
-    const end = ta.selectionEnd
-    const next = value.slice(0, start) + text + value.slice(end)
-    handleChange(next)
-    requestAnimationFrame(() => {
-      ta.selectionStart = ta.selectionEnd = start + text.length
-      ta.focus()
-    })
-  }
-
   const onEditorKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Tab') {
       e.preventDefault()
@@ -647,7 +773,7 @@ export default function App() {
   // ---------------------------------------------------------------- 渲染树
   return (
     <div
-      className={`app${entering ? ' is-entering' : ''}${dragging ? ' is-dragging' : ''}`}
+      className={`app${entering ? ' is-entering' : ''}${dragging ? ' is-dragging' : ''}${maximized ? ' is-maximized' : ''}`}
       onDragOver={(e) => {
         if (e.dataTransfer.types.includes('Files')) {
           e.preventDefault()
@@ -731,6 +857,13 @@ export default function App() {
           <button className="win-btn" onClick={() => window.api.hide()} title="收起">
             <Icon name="minus" size={15} />
           </button>
+          <button
+            className="win-btn"
+            onClick={() => window.api.toggleMaximize()}
+            title={maximized ? '还原' : '最大化'}
+          >
+            <Icon name={maximized ? 'restore' : 'maximize'} size={13} />
+          </button>
           <button className="win-btn danger" onClick={() => window.api.hide()} title="关闭">
             <Icon name="close" size={15} />
           </button>
@@ -748,6 +881,8 @@ export default function App() {
             setQuery={setQuery}
             onOpen={openDoc}
             onNew={createDoc}
+            folders={folders}
+            onNewFolder={createFolder}
             onDelete={deleteDoc}
             onRename={renameDoc}
             onReveal={(p) => window.api.revealDoc(p)}
@@ -892,6 +1027,10 @@ export default function App() {
                       spellCheck={false}
                       onChange={(e) => handleChange(e.target.value)}
                       onKeyDown={onEditorKeyDown}
+                      onKeyUp={rememberCaret}
+                      onMouseUp={rememberCaret}
+                      onSelect={rememberCaret}
+                      onFocus={rememberCaret}
                       onPaste={onPaste}
                       placeholder="开始记录…"
                     />
@@ -954,7 +1093,8 @@ export default function App() {
           onResize={(w) => patchConfig({ aiPanelWidth: w })}
           onPickModel={(id) => patchConfig({ aiModelId: id })}
           onManageModels={() => setModelsOpen(true)}
-          onInsert={insertText}
+          onInsert={appendText}
+          onInsertAtCursor={insertAtCaret}
           onReplaceDoc={requestReplace}
           onNewDoc={createFromAi}
           onCopy={copy}
@@ -964,6 +1104,10 @@ export default function App() {
 
       {selection && (
         <div className="sel-bar" style={{ left: selection.x, top: selection.y }}>
+          <span className={`sel-count${aiOpen ? ' is-live' : ''}`} title={aiOpen ? '已同步到右侧 AI 面板' : '选中内容'}>
+            <b>{selection.text.length}</b> 字{aiOpen ? ' · 已带入 AI' : ''}
+          </span>
+          <span className="sel-sep" />
           <button onClick={() => askWithSelection('explain')}>
             <Icon name="alert" size={12} /> 解释
           </button>
@@ -1023,6 +1167,7 @@ export default function App() {
           if (res) {
             setConfig(res.config)
             setDocs(res.docs)
+      window.api.listFolders().then(setFolders).catch(() => undefined)
             setTabs([])
             setActive(null)
             setContents({})

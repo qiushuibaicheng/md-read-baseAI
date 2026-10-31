@@ -1,8 +1,11 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import MessageBody from './MessageBody'
 import { Icon } from './Icons'
-import { SKILLS, buildSystemPrompt, estimateTokens, unwrapFence } from '../lib/ai'
-import type { AiSession, AiSessionMessage, ModelProfile } from '../lib/types'
+import { SKILLS, buildSystemPrompt, estimateTokens, packContextFiles, unwrapFence } from '../lib/ai'
+import type { AiSession, AiSessionMessage, DocMeta, ModelProfile } from '../lib/types'
+
+const BUDGET_STEPS = [8000, 16000, 32000, 64000, 128000]
+const fmtK = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
 
 const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 const MAX_HISTORY = 12
@@ -28,6 +31,7 @@ interface Props {
   onPickModel: (id: string) => void
   onManageModels: () => void
   onInsert: (text: string) => void
+  onInsertAtCursor: (text: string) => void
   onReplaceDoc: (text: string) => void
   onNewDoc: (title: string, content: string) => void
   onCopy: (text: string, label?: string) => void
@@ -50,6 +54,7 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
     onPickModel,
     onManageModels,
     onInsert,
+    onInsertAtCursor,
     onReplaceDoc,
     onNewDoc,
     onCopy,
@@ -61,13 +66,27 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
   const [input, setInput] = useState('')
   const [attachDoc, setAttachDoc] = useState(true)
   const [attachSelection, setAttachSelection] = useState(true)
+  const [selOpen, setSelOpen] = useState(false)
   const [live, setLive] = useState<{ reqId: string; id: string } | null>(null)
   const [menu, setMenu] = useState<'model' | 'history' | 'skills' | null>(null)
   const [loaded, setLoaded] = useState(false)
+  const [ctxOpen, setCtxOpen] = useState(false)
+  const [ctxQuery, setCtxQuery] = useState('')
+  const [docList, setDocList] = useState<DocMeta[]>([])
+  const [budget, setBudgetState] = useState(() => {
+    const raw = Number(localStorage.getItem('inkwell.ctxBudget'))
+    return Number.isFinite(raw) && raw >= 4000 ? raw : 32000
+  })
+  const setBudget = useCallback((v: number) => {
+    setBudgetState(v)
+    localStorage.setItem('inkwell.ctxBudget', String(v))
+  }, [])
+  const [toolNote, setToolNote] = useState<string | null>(null)
 
   const listRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
   const pending = useRef<Map<string, { sessionId: string; messageId: string }>>(new Map())
+  const contentCache = useRef<Map<string, string>>(new Map())
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const stickBottom = useRef(true)
 
@@ -129,6 +148,57 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
     return fresh
   }, [session, docPath])
 
+  // ---------------------------------------------------------------- 上下文文档
+  const contextPaths = session?.contextPaths || []
+
+  const setContextPaths = useCallback(
+    (next: string[]) => {
+      const target = session || ensureSession()
+      mutateSession(target.id, (s) => ({ ...s, contextPaths: next, updatedAt: Date.now() }))
+    },
+    [session, ensureSession, mutateSession]
+  )
+
+  const toggleContextPath = useCallback(
+    (path: string) => {
+      const now = session?.contextPaths || []
+      setContextPaths(now.includes(path) ? now.filter((p) => p !== path) : [...now, path])
+    },
+    [session, setContextPaths]
+  )
+
+  const loadDocList = useCallback(async () => {
+    const list = await window.api.listDocs()
+    setDocList(list)
+    return list
+  }, [])
+
+  const openPicker = useCallback(async () => {
+    setCtxOpen(true)
+    setCtxQuery('')
+    if (!docList.length) await loadDocList()
+  }, [docList.length, loadDocList])
+
+  /** 读取选中文档的正文（带缓存，避免每轮重复读盘） */
+  const readContextFiles = useCallback(async (paths: string[]) => {
+    const out: { path: string; title: string; content: string }[] = []
+    for (const p of paths) {
+      let content = contentCache.current.get(p)
+      if (content === undefined) {
+        try {
+          const res = await window.api.readDoc(p)
+          content = res.content
+          contentCache.current.set(p, content)
+        } catch {
+          continue
+        }
+      }
+      const meta = docList.find((d) => d.path === p)
+      out.push({ path: p, title: meta?.title || p.split('/').pop() || p, content })
+    }
+    return out
+  }, [docList])
+
   // ---------------------------------------------------------------- 流式事件
   const scrollToBottom = useCallback(() => {
     if (!stickBottom.current) return
@@ -154,6 +224,7 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
         })
         pending.current.delete(d.reqId)
         setLive(null)
+        setToolNote(null)
         scrollToBottom()
       }),
       window.api.aiOnError((d) => {
@@ -168,14 +239,48 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
         if (!target) return
         pending.current.delete(d.reqId)
         setLive(null)
+        setToolNote(null)
+      }),
+      window.api.aiOnTool((d) => {
+        if (d.status === 'unsupported') {
+          setToolNote('当前模型不支持读取文档，本次只用了已带入的内容')
+          return
+        }
+        if (!d.name) return
+        let detail = ''
+        try {
+          const args = JSON.parse(d.args || '{}')
+          detail = String(args.path || args.query || '')
+        } catch {
+          /* ignore */
+        }
+        const label =
+          d.name === 'read_doc'
+            ? `读取 ${detail}`
+            : d.name === 'search_docs'
+              ? `检索「${detail}」`
+              : '列出文档'
+        setToolNote(d.status === 'running' ? `${label} 中…` : `已${label}`)
+
+        if (d.status === 'done') {
+          const target = pending.current.get(d.reqId)
+          if (target) {
+            mutateSession(target.sessionId, (s) => ({
+              ...s,
+              messages: s.messages.map((m) =>
+                m.id === target.messageId ? { ...m, tools: [...(m.tools || []), label] } : m
+              )
+            }))
+          }
+        }
       })
     ]
     return () => offs.forEach((off) => off())
-  }, [patchMessage, scrollToBottom])
+  }, [patchMessage, scrollToBottom, mutateSession])
 
   // ---------------------------------------------------------------- 发送
   const send = useCallback(
-    (text: string, opts: { display?: string; insertable?: boolean } = {}) => {
+    async (text: string, opts: { display?: string; insertable?: boolean } = {}) => {
       const content = text.trim()
       if (!content || live) return
       if (!activeModel) {
@@ -200,17 +305,6 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
         model: activeModel.model
       }
 
-      const history = current.messages
-        .filter((m) => m.content.trim() && !m.error)
-        .slice(-MAX_HISTORY)
-        .map((m) => ({ role: m.role, content: m.content }))
-
-      const system = buildSystemPrompt({
-        docTitle,
-        docContent: attachDoc ? docContent : '',
-        selection: attachSelection && selection ? selection : ''
-      })
-
       mutateSession(current.id, (s) => ({
         ...s,
         title: s.messages.length === 0 ? (opts.display || content).replace(/\s+/g, ' ').slice(0, 28) : s.title,
@@ -219,24 +313,70 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
         messages: [...s.messages, userMsg, assistantMsg]
       }))
 
+      // 先把气泡挂上去，读盘与请求都在之后，避免界面卡住
       const reqId = uid()
       pending.current.set(reqId, { sessionId: current.id, messageId: assistantId })
       setLive({ reqId, id: assistantId })
+      setToolNote(null)
       stickBottom.current = true
+      requestAnimationFrame(scrollToBottom)
 
-      window.api
-        .aiChat({
+      const history = current.messages
+        .filter((m) => m.content.trim() && !m.error)
+        .slice(-MAX_HISTORY)
+        .map((m) => ({ role: m.role, content: m.content }))
+
+      try {
+        const picked = await readContextFiles(contextPaths)
+        if (attachDoc && docContent) {
+          const idx = picked.findIndex((f) => f.path === docPath)
+          const self = { path: docPath || docTitle || '当前文档', title: docTitle || '当前文档', content: docContent }
+          if (idx >= 0) picked[idx] = self
+          else picked.unshift(self)
+        }
+        const packed = packContextFiles(picked, budget)
+        const system = buildSystemPrompt({
+          selection: attachSelection && selection ? selection : '',
+          contextFiles: packed,
+          // 只有明确挑过文档时才把全库清单塞进去，普通问答不浪费上下文
+          library:
+            contextPaths.length && docList.length
+              ? docList.map((d) => ({ path: d.path, title: d.title, size: d.size }))
+              : undefined
+        })
+
+        await window.api.aiChat({
           reqId,
           profileId: activeModel.id,
           system,
-          messages: [...history, { role: 'user', content }]
+          messages: [...history, { role: 'user', content }],
+          tools: true
         })
-        .catch((err) => {
-          patchMessage(current.id, assistantId, { error: String(err?.message || err) })
-          setLive(null)
-        })
+      } catch (err) {
+        patchMessage(current.id, assistantId, { error: String((err as Error)?.message || err) })
+        pending.current.delete(reqId)
+        setLive(null)
+      }
     },
-    [activeModel, live, ensureSession, mutateSession, docTitle, docContent, docPath, attachDoc, attachSelection, selection, onToast, patchMessage]
+    [
+      activeModel,
+      live,
+      ensureSession,
+      mutateSession,
+      docTitle,
+      docContent,
+      docPath,
+      attachDoc,
+      attachSelection,
+      selection,
+      onToast,
+      patchMessage,
+      contextPaths,
+      budget,
+      docList,
+      readContextFiles,
+      scrollToBottom
+    ]
   )
 
   useImperativeHandle(
@@ -308,6 +448,14 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
   }
 
   // ---------------------------------------------------------------- 渲染
+  const filteredDocs = useMemo(() => {
+    const q = ctxQuery.trim().toLowerCase()
+    const list = q
+      ? docList.filter((d) => d.title.toLowerCase().includes(q) || d.path.toLowerCase().includes(q))
+      : docList
+    return list.slice(0, 200)
+  }, [docList, ctxQuery])
+
   const contextTokens = useMemo(() => {
     if (!attachDoc) return 0
     return estimateTokens(docContent)
@@ -423,7 +571,7 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
             <p>
               {docTitle ? `当前文档：${docTitle}` : '选一篇文档，或直接问我任何问题'}
               <br />
-              它会带着全文和你的选区作为上下文回答。
+              需要多篇一起看时，点下方「上下文」挑给 AI。
             </p>
             <div className="skill-grid">
               {SKILLS.map((s) => (
@@ -453,6 +601,13 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
                     </span>
                   )}
                 </div>
+
+                {m.tools?.length ? (
+                  <div className="ai-tools-used">
+                    <Icon name="folder" size={11} />
+                    <span>{m.tools.join(' · ')}</span>
+                  </div>
+                ) : null}
 
                 {m.reasoning ? (
                   <details className="ai-reasoning">
@@ -484,8 +639,11 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
                     <button onClick={() => onCopy(m.content, '已复制回答')}>
                       <Icon name="copy" size={12} /> 复制
                     </button>
-                    <button onClick={() => onInsert(unwrapFence(m.content))}>
-                      <Icon name="insert" size={12} /> 插入
+                    <button className="is-primary" onClick={() => onInsertAtCursor(unwrapFence(m.content))} title="插入到刚才的光标位置（会保留你选中的文本范围）">
+                      <Icon name="insert" size={12} /> 插入到光标处
+                    </button>
+                    <button onClick={() => onInsert(unwrapFence(m.content))} title="追加到文档末尾">
+                      <Icon name="enter" size={12} /> 文末
                     </button>
                     <button onClick={() => applyToDoc(m.content)}>
                       <Icon name="diff" size={12} /> 替换全文
@@ -513,7 +671,118 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
       </div>
 
       <div className="ai-composer">
+        {selection && attachSelection && (
+          <div className={`ai-sel${selOpen ? ' is-open' : ''}`}>
+            <button className="ai-sel-head" onClick={() => setSelOpen((v) => !v)} title="展开 / 收起选中的原文">
+              <Icon name="cursor" size={11} />
+              <span>
+                已带入选区 <b>{selection.length}</b> 字
+              </span>
+              <Icon name="chevron" size={11} />
+            </button>
+            <button
+              className="ai-sel-drop"
+              onClick={() => {
+                setAttachSelection(false)
+                setSelOpen(false)
+              }}
+              title="这次不带入选区"
+            >
+              <Icon name="close" size={10} />
+            </button>
+            {selOpen && (
+              <pre className="ai-sel-body">{selection.length > 1600 ? `${selection.slice(0, 1600)}\n…` : selection}</pre>
+            )}
+          </div>
+        )}
+
+        {ctxOpen && (
+          <div className="ctx-pop">
+            <div className="ctx-head">
+              <span>带入上下文的文档</span>
+              <button className="icon-btn tiny" onClick={() => setCtxOpen(false)} title="关闭">
+                <Icon name="close" size={11} />
+              </button>
+            </div>
+            <div className="ctx-search">
+              <Icon name="search" size={12} />
+              <input
+                autoFocus
+                value={ctxQuery}
+                onChange={(e) => setCtxQuery(e.target.value)}
+                placeholder="搜索标题或路径"
+              />
+              {ctxQuery && (
+                <button className="icon-btn tiny" onClick={() => setCtxQuery('')}>
+                  <Icon name="close" size={10} />
+                </button>
+              )}
+            </div>
+            <div className="ctx-list">
+              {filteredDocs.length === 0 && <div className="ctx-empty">没有匹配的文档</div>}
+              {filteredDocs.map((d) => {
+                const on = contextPaths.includes(d.path)
+                return (
+                  <button
+                    key={d.path}
+                    className={`ctx-row${on ? ' is-on' : ''}`}
+                    onClick={() => toggleContextPath(d.path)}
+                    title={d.path}
+                  >
+                    <span className="ctx-check">{on && <Icon name="check" size={10} />}</span>
+                    <span className="ctx-name">
+                      {d.title}
+                      <small>{d.path}</small>
+                    </span>
+                    <span className="ctx-size">{d.size > 1000 ? `${Math.round(d.size / 1000)}k` : d.size} 字</span>
+                  </button>
+                )
+              })}
+            </div>
+            <div className="ctx-foot">
+              <div className="ctx-budget">
+                <span>预算</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={BUDGET_STEPS.length - 1}
+                  step={1}
+                  value={Math.max(0, BUDGET_STEPS.indexOf(budget))}
+                  onChange={(e) => setBudget(BUDGET_STEPS[Number(e.target.value)])}
+                />
+                <b>{fmtK(budget)}</b>
+              </div>
+              <button
+                className="btn-primary"
+                onClick={() => {
+                  setCtxOpen(false)
+                  if (!contextPaths.length) onToast('已清空上下文，只带当前文档')
+                }}
+              >
+                完成
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="ai-chips">
+          <button
+            className={`ai-tag${contextPaths.length ? ' is-on' : ''}`}
+            onClick={() => (ctxOpen ? setCtxOpen(false) : openPicker())}
+            title="选择要一起带给 AI 的文档（本会话有效）"
+          >
+            <Icon name="folder" size={11} />
+            上下文{contextPaths.length ? ` ${contextPaths.length}` : ''}
+          </button>
+          {contextPaths.slice(0, 1).map((p) => (
+            <span key={p} className="ai-file" title={p}>
+              <span>{p.split('/').pop()}</span>
+              <button onClick={() => toggleContextPath(p)} title="移出上下文">
+                <Icon name="close" size={9} />
+              </button>
+            </span>
+          ))}
+          {contextPaths.length > 1 && <span className="ai-file more">+{contextPaths.length - 1}</span>}
           <button
             className={`ai-tag${attachDoc ? ' is-on' : ''}`}
             onClick={() => setAttachDoc((v) => !v)}
@@ -553,6 +822,13 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
                 <small>{s.hint}</small>
               </button>
             ))}
+          </div>
+        )}
+
+        {toolNote && (
+          <div className="ai-tool-note">
+            <span className="ai-tool-dot" />
+            {toolNote}
           </div>
         )}
 

@@ -210,6 +210,55 @@ async function scanVault(dir = config.vaultPath): Promise<DocMeta[]> {
   return out
 }
 
+/** 扫描全部子目录（含空目录），返回相对路径，例如 ["排查", "排查/502"] */
+async function scanFolders(root = config.vaultPath): Promise<string[]> {
+  const out: string[] = []
+  async function walk(current: string, depth: number) {
+    if (depth > 6) return
+    let entries: any[] = []
+    try {
+      entries = await fsp.readdir(current, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      if (entry.name.startsWith('.') || IGNORED.has(entry.name)) continue
+      const abs = join(current, entry.name)
+      out.push(relative(root, abs).split('\\').join('/'))
+      await walk(abs, depth + 1)
+    }
+  }
+  await walk(root, 0)
+  out.sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+  return out
+}
+
+/** 全库关键词检索，供 IPC 与 AI 工具共用 */
+async function searchVault(query: string) {
+  const q = query.trim().toLowerCase()
+  if (!q) return [] as { path: string; title: string; hits: { line: number; text: string }[] }[]
+  const docs = await scanVault()
+  const results: { path: string; title: string; hits: { line: number; text: string }[] }[] = []
+  for (const doc of docs) {
+    const nameHit = doc.title.toLowerCase().includes(q) || doc.name.toLowerCase().includes(q)
+    let content = ''
+    try {
+      content = await fsp.readFile(safePath(doc.path), 'utf-8')
+    } catch {
+      continue
+    }
+    const lines = content.split(/\r?\n/)
+    const hits: { line: number; text: string }[] = []
+    for (let i = 0; i < lines.length && hits.length < 3; i++) {
+      if (lines[i].toLowerCase().includes(q)) hits.push({ line: i + 1, text: lines[i].trim().slice(0, 160) })
+    }
+    if (hits.length || nameHit) results.push({ path: doc.path, title: doc.title, hits })
+    if (results.length >= 40) break
+  }
+  return results
+}
+
 function safePath(rel: string) {
   const abs = resolve(config.vaultPath, rel)
   const root = resolve(config.vaultPath)
@@ -309,7 +358,7 @@ function createWindow() {
     backgroundColor: '#0c0e14',
     hasShadow: true,
     resizable: true,
-    maximizable: false,
+    maximizable: true,
     fullscreenable: false,
     alwaysOnTop: config.alwaysOnTop,
     skipTaskbar: false,
@@ -344,11 +393,16 @@ function createWindow() {
 
   win.on('resize', () => {
     if (!win) return
+    // 最大化/还原过程中也会触发，别把屏宽写进配置
+    if (win.isMaximized()) return
     const [w, h] = win.getSize()
     config.windowWidth = w
     config.windowHeight = h
     saveConfig()
   })
+
+  win.on('maximize', () => win?.webContents.send('window:maximized', true))
+  win.on('unmaximize', () => win?.webContents.send('window:maximized', false))
 
   win.on('close', (e) => {
     if (!isQuitting) {
@@ -483,6 +537,29 @@ function setupIPC() {
 
   ipcMain.handle('vault:list', () => scanVault())
 
+  ipcMain.handle('vault:folders', () => scanFolders())
+
+  ipcMain.handle('vault:mkdir', async (_e, payload: { parent?: string; name: string }) => {
+    const raw = (payload?.name || '').replace(/[\\/:*?"<>|]/g, '').trim()
+    if (!raw) throw new Error('文件夹名不能为空')
+    const parentAbs = payload?.parent ? safePath(payload.parent) : config.vaultPath
+    const abs = join(parentAbs, raw)
+    if (existsSync(abs)) throw new Error(`「${raw}」已存在`)
+    await fsp.mkdir(abs, { recursive: true })
+    return relative(config.vaultPath, abs).split('\\').join('/')
+  })
+
+  ipcMain.handle('doc:move', async (_e, rel: string, targetDir: string) => {
+    const abs = safePath(rel)
+    const destDir = targetDir ? safePath(targetDir) : config.vaultPath
+    ensureDir(destDir)
+    const dest = join(destDir, basename(abs))
+    if (resolve(dest) === resolve(abs)) return rel
+    if (existsSync(dest)) throw new Error('目标文件夹里已有同名文件')
+    await fsp.rename(abs, dest)
+    return relative(config.vaultPath, dest).split('\\').join('/')
+  })
+
   ipcMain.handle('vault:pick', async () => {
     if (!win) return null
     suppressBlurHide = true
@@ -554,29 +631,7 @@ function setupIPC() {
     await shell.openPath(safePath(rel))
   })
 
-  ipcMain.handle('search', async (_e, query: string) => {
-    const q = query.trim().toLowerCase()
-    if (!q) return []
-    const docs = await scanVault()
-    const results: { path: string; title: string; hits: { line: number; text: string }[] }[] = []
-    for (const doc of docs) {
-      const nameHit = doc.title.toLowerCase().includes(q) || doc.name.toLowerCase().includes(q)
-      let content = ''
-      try {
-        content = await fsp.readFile(safePath(doc.path), 'utf-8')
-      } catch {
-        continue
-      }
-      const lines = content.split(/\r?\n/)
-      const hits: { line: number; text: string }[] = []
-      for (let i = 0; i < lines.length && hits.length < 3; i++) {
-        if (lines[i].toLowerCase().includes(q)) hits.push({ line: i + 1, text: lines[i].trim().slice(0, 160) })
-      }
-      if (hits.length || nameHit) results.push({ path: doc.path, title: doc.title, hits })
-      if (results.length >= 40) break
-    }
-    return results
-  })
+  ipcMain.handle('search', (_e, query: string) => searchVault(query))
 
   ipcMain.handle('snippets:save', (_e, list: unknown) => {
     writeJSON(SNIPPET_FILE, list)
@@ -651,6 +706,13 @@ function setupIPC() {
   })
 
   ipcMain.handle('window:hide', () => win?.hide())
+  ipcMain.handle('window:maximize', () => {
+    if (!win) return false
+    if (win.isMaximized()) win.unmaximize()
+    else win.maximize()
+    return win.isMaximized()
+  })
+  ipcMain.handle('window:isMaximized', () => win?.isMaximized() ?? false)
   ipcMain.handle('window:pin', (_e, on: boolean) => {
     config.alwaysOnTop = on
     saveConfig()
@@ -714,7 +776,11 @@ if (!gotLock) {
     )
 
     setupIPC()
-    registerAi(USER_DIR, () => win)
+    registerAi(USER_DIR, () => win, () => ({
+      list: async () => (await scanVault()).map((d) => ({ path: d.path, title: d.title, size: d.size })),
+      read: (rel: string) => fsp.readFile(safePath(rel), 'utf-8'),
+      search: (q: string) => searchVault(q)
+    }))
     createWindow()
     createTray()
     startClipWatch()

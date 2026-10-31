@@ -49,6 +49,13 @@ const P: Record<string, ReactNode> = {
   moon: <path d="M20 14.5A8 8 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5z" />,
   close: <path d="M6 6l12 12M18 6L6 18" />,
   minus: <path d="M5 12h14" />,
+  maximize: <rect x="5.5" y="5.5" width="13" height="13" rx="1.6" />,
+  restore: (
+    <>
+      <rect x="4.5" y="7.5" width="11" height="11" rx="1.6" />
+      <path d="M8 7.5V5.2A1.2 1.2 0 0 1 9.2 4h9.6A1.2 1.2 0 0 1 20 5.2v9.6a1.2 1.2 0 0 1-1.2 1.2h-2.3" />
+    </>
+  ),
   sidebar: (
     <>
       <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" />
@@ -175,6 +182,12 @@ const P: Record<string, ReactNode> = {
     <>
       <path d="M4 20 15 9" />
       <path d="M13.5 3.5 15 7l3.5 1.5L15 10l-1.5 3.5L12 10 8.5 8.5 12 7z" />
+    </>
+  ),
+  'folder-plus': (
+    <>
+      <path d="M3.5 7.2A1.7 1.7 0 0 1 5.2 5.5h3.6l1.8 2.2h8.2a1.7 1.7 0 0 1 1.7 1.7v7.9a1.7 1.7 0 0 1-1.7 1.7H5.2a1.7 1.7 0 0 1-1.7-1.7z" />
+      <path d="M12 11.5v5M9.5 14h5" />
     </>
   ),
   brain: (

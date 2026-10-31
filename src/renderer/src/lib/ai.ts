@@ -90,28 +90,104 @@ export const SKILLS: AiSkill[] = [
   }
 ]
 
-export const BASE_INSTRUCTIONS = `你是 Inkwell 内置的写作与排查助手，服务对象是做线上问题定位的工程师。
+export const BASE_INSTRUCTIONS = `你是 Inkwell 里的排查与写作搭档。使用者是工程师，日常是：线上出问题 → 翻日志和文档 → 定位 → 写记录。你的价值在于把散乱信息变成可以直接行动的结论。
 
-行为准则：
-- 默认用简体中文回答；代码、命令、日志、配置保持原样。
-- 回答围绕「能直接拿去用」：给结论、给命令、给下一步，不写客套话。
-- 遇到不确定的信息，明确说"文档里没有提到"，不要编造数值、时间或结论。
-- 需要结构化时用 Markdown 小标题、列表、表格；涉及链路、时序时优先给 mermaid 代码块。
-- 当用户要求"只输出结果"时，严格只输出可插入的内容，不要额外解释。`
+# 回答方式
+- 结论先行。第一段就给出答案或判断，不要用"好的""让我来分析一下"这类铺垫。
+- 分层展开：**结论** → **依据**（引用原文、数值、行号、报错）→ **下一步**（可复制的命令、要确认的点）。
+- 不确定就明说。材料里没有的信息写"现有材料没有提到"，绝不补一个看起来合理的数值、时间或结论。
+- 代码、命令、日志、配置、报错保持原样，不改写、不翻译、不美化。
+- 默认简体中文；专有名词、错误码、字段名保留英文原文。
+
+# 使用材料
+- \`<context-files>\` 是用户这次勾选给你的文档，作为权威证据。引用时在句末用 [[文件名]] 标注出处。
+- \`<library>\` 是笔记库路径清单。它只告诉你"有哪些材料"，不是内容本身。
+- 你有三个工具：list_docs（列文档）、read_doc（读全文）、search_docs（全库检索）。
+- 需要看具体内容就调用工具，不要凭文件名猜内容，更不要假装读过没读的文档。
+- 一次任务最多读 3 篇；读完必须收敛到结论，不要反复翻文档。
+- \`<selection>\` 是用户此刻选中的片段，视为焦点：优先解释、改写或针对它作答，而不是泛泛谈整篇文档。
+- 材料之间冲突时，指出冲突本身，并说明哪个更可信及理由。
+
+# 输出结构
+- 链路、时序、状态流转：优先 mermaid 代码块（graph TD / sequenceDiagram），节点文字简短。
+- 归因、层级、并列项：用列表。指标对比、字段对照：用表格。
+- 需要落到文档的内容：直接给完整可粘贴的 Markdown，不要用代码块包裹整段。
+- 长度跟问题匹配。一句话能答清的就一句话，不要为了显得完整而注水。`
+
+export interface ContextFile {
+  path: string
+  title: string
+  content: string
+}
+
+export interface PackedFile extends ContextFile {
+  /** 实际注入的字符数 */
+  used: number
+  truncated: boolean
+}
+
+/** 按 token 预算把文档内容装进上下文：先均分，再把剩余额度补给被截断的篇目 */
+export function packContextFiles(files: ContextFile[], budgetTokens: number): PackedFile[] {
+  if (!files.length) return []
+  // 中文约 0.68 token/字 → 1 token ≈ 1.45 字；留 20% 给系统提示和回答
+  const charBudget = Math.max(2000, Math.floor(budgetTokens * 1.45 * 0.8))
+  const fair = Math.max(1200, Math.floor(charBudget / files.length))
+  const alloc = files.map((f) => Math.min(f.content.length, fair))
+  let spare = charBudget - alloc.reduce((a, b) => a + b, 0)
+  for (let i = 0; i < files.length && spare > 0; i++) {
+    const need = files[i].content.length - alloc[i]
+    if (need > 0) {
+      const add = Math.min(need, spare)
+      alloc[i] += add
+      spare -= add
+    }
+  }
+  return files.map((f, i) => ({
+    ...f,
+    used: alloc[i],
+    truncated: alloc[i] < f.content.length
+  }))
+}
 
 export function buildSystemPrompt(opts: {
   docTitle?: string
   docContent?: string
   selection?: string
+  contextFiles?: PackedFile[]
+  library?: { path: string; title: string; size: number }[]
   extra?: string
 }): string {
   const parts = [BASE_INSTRUCTIONS]
-  if (opts.docTitle || opts.docContent) {
+
+  if (opts.contextFiles?.length) {
+    const blocks = opts.contextFiles.map((f) => {
+      const body = f.used > 0 ? f.content.slice(0, f.used) : ''
+      const cut = f.truncated ? `\n\n…（此文件较长，仅提供前 ${f.used} 字符；需要后续内容请用 read_doc 读取 ${f.path}）` : ''
+      return `<file path="${f.path}" title="${f.title}">\n${body}${cut}\n</file>`
+    })
+    const dropped = opts.contextFiles.filter((f) => f.used === 0).map((f) => f.path)
+    parts.push(
+      `## 用户本次提供的文档\n这些是本次对话的依据，回答问题优先使用它们。\n\n<context-files>\n${blocks.join(
+        '\n'
+      )}\n</context-files>${dropped.length ? `\n\n（受上下文长度限制，以下文件本次未展开：${dropped.join('、')}）` : ''}`
+    )
+  } else if (opts.docTitle || opts.docContent) {
     const body = (opts.docContent || '').slice(0, 24000)
     parts.push(
       `## 当前打开的文档\n标题：${opts.docTitle || '未命名'}\n\n<document>\n${body}\n</document>`
     )
   }
+
+  if (opts.library?.length) {
+    const list = opts.library
+      .slice(0, 200)
+      .map((d) => `- ${d.path}（${d.title}，${d.size} 字符）`)
+      .join('\n')
+    parts.push(
+      `## 笔记库路径清单（共 ${opts.library.length} 篇）\n以下只是路径与标题，内容需要用 read_doc 读取。\n\n<library>\n${list}\n</library>`
+    )
+  }
+
   if (opts.selection) {
     parts.push(`## 用户选中的片段\n<selection>\n${opts.selection.slice(0, 8000)}\n</selection>`)
   }

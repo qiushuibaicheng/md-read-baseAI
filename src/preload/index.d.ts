@@ -42,12 +42,15 @@ export interface AiSessionMessage {
   model?: string
   usage?: { prompt: number; completion: number }
   error?: string
+  tools?: string[]
 }
 
 export interface AiSession {
   id: string
   title: string
   docPath: string | null
+  contextPaths?: string[]
+  budget?: number
   messages: AiSessionMessage[]
   createdAt: number
   updatedAt: number
@@ -60,6 +63,7 @@ export interface AiChatRequest {
   messages: { role: 'system' | 'user' | 'assistant'; content: string }[]
   temperature?: number
   maxTokens?: number
+  tools?: boolean
 }
 
 export interface DocMeta {
@@ -105,6 +109,9 @@ export interface InkAPI {
   init(): Promise<InitPayload>
   setConfig(patch: Partial<AppConfig>): Promise<AppConfig>
   listDocs(): Promise<DocMeta[]>
+  listFolders(): Promise<string[]>
+  makeFolder(payload: { parent?: string; name: string }): Promise<string>
+  moveDoc(rel: string, targetDir: string): Promise<string>
   pickVault(): Promise<{ config: AppConfig; docs: DocMeta[] } | null>
   vaultPath(): Promise<string>
   readDoc(rel: string): Promise<{ content: string; mtime: number }>
@@ -136,6 +143,8 @@ export interface InkAPI {
   aiSaveSessions(list: AiSession[]): Promise<boolean>
   hide(): Promise<void>
   pin(on: boolean): Promise<boolean>
+  toggleMaximize(): Promise<boolean>
+  isMaximized(): Promise<boolean>
   quit(): Promise<void>
   version(): Promise<string>
   openVault(): Promise<void>
@@ -144,12 +153,22 @@ export interface InkAPI {
   onVaultChanged(cb: (docs: DocMeta[]) => void): () => void
   onConfigChanged(cb: (cfg: AppConfig) => void): () => void
   onWindowShown(cb: () => void): () => void
+  onMaximized(cb: (on: boolean) => void): () => void
   onOpenSettings(cb: () => void): () => void
   onThemeSystem(cb: (dark: boolean) => void): () => void
   aiOnStream(cb: (d: { reqId: string; text: string; reasoning: string }) => void): () => void
   aiOnDone(cb: (d: { reqId: string; text: string; reasoning: string; usage?: { prompt: number; completion: number } }) => void): () => void
   aiOnError(cb: (d: { reqId: string; message: string }) => void): () => void
   aiOnAborted(cb: (d: { reqId: string }) => void): () => void
+  aiOnTool(
+    cb: (d: {
+      reqId: string
+      name: string
+      args?: string
+      status: 'running' | 'done' | 'unsupported'
+      preview?: string
+    }) => void
+  ): () => void
 }
 
 declare global {

@@ -42,12 +42,18 @@ export interface AiSessionMessage {
   model?: string
   usage?: { prompt: number; completion: number }
   error?: string
+  /** 本次回答期间调用过的工具摘要，例如「读取 排查/502.md」 */
+  tools?: string[]
 }
 
 export interface AiSession {
   id: string
   title: string
   docPath: string | null
+  /** 本会话带入上下文的文档路径（会话级作用域） */
+  contextPaths?: string[]
+  /** 上下文 token 预算 */
+  budget?: number
   messages: AiSessionMessage[]
   createdAt: number
   updatedAt: number
