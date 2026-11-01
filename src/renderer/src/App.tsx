@@ -196,7 +196,12 @@ export default function App() {
 
     const offs = [
       window.api.onClipboardChanged(setClips),
-      window.api.onVaultChanged((list) => setDocs((prev) => mergeDocs(prev, list))),
+      window.api.onSnippetsChanged((list) => setSnippets(list)),
+      // AI 会建目录、移动、删除，所以文档和文件夹一起刷
+      window.api.onVaultChanged((list) => {
+        setDocs((prev) => mergeDocs(prev, list))
+        window.api.listFolders().then(setFolders).catch(() => undefined)
+      }),
       window.api.onConfigChanged(setConfig),
       window.api.onThemeSystem(setSystemDark),
       window.api.onWindowShown(() => {
@@ -655,6 +660,14 @@ export default function App() {
       return
     }
     const res = await window.api.aiApplyWrite(id)
+    if (res.ok && res.deleted) {
+      const gone = res.path || w.path
+      setWrites((ws) => ws.filter((x) => x.id !== id))
+      closeTab(gone)
+      setDocs(await window.api.listDocs())
+      showToast('已移入回收站')
+      return
+    }
     if (!res.ok || !res.path || typeof res.content !== 'string') {
       await window.api.aiDiscardWrite(id)
       setWrites((ws) => ws.filter((x) => x.id !== id))
@@ -1334,6 +1347,7 @@ export default function App() {
           onNewDoc={createFromAi}
           onCopy={copy}
           onToast={showToast}
+          readCaret={() => ({ path: caretRef.current?.path || null, start: caretRef.current?.start ?? -1 })}
         />
       </div>
 

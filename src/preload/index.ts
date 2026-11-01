@@ -54,6 +54,17 @@ const api = {
   aiSaveSessions: (list: unknown) => ipcRenderer.invoke('ai:sessions:save', list),
   aiApplyWrite: (id: string) => ipcRenderer.invoke('ai:write:apply', id),
   aiDiscardWrite: (id: string) => ipcRenderer.invoke('ai:write:discard', id),
+  aiAnswer: (id: string, answer: string) => ipcRenderer.invoke('ai:ask:answer', { id, answer }),
+
+  extSkills: () => ipcRenderer.invoke('ext:skills'),
+  extSkillSave: (input: unknown) => ipcRenderer.invoke('ext:skill:save', input),
+  extSkillRemove: (name: string) => ipcRenderer.invoke('ext:skill:remove', name),
+  extSkillReveal: () => ipcRenderer.invoke('ext:skill:reveal'),
+  extMcpConfig: () => ipcRenderer.invoke('ext:mcp:config'),
+  extMcpSave: (cfg: unknown) => ipcRenderer.invoke('ext:mcp:save', cfg),
+  extMcpStatus: (reload?: boolean) => ipcRenderer.invoke('ext:mcp:status', reload),
+  extMcpTools: () => ipcRenderer.invoke('ext:mcp:tools'),
+  extMcpFile: () => ipcRenderer.invoke('ext:mcp:file'),
 
   hide: () => ipcRenderer.invoke('window:hide'),
   pin: (on: boolean) => ipcRenderer.invoke('window:pin', on),
@@ -65,6 +76,7 @@ const api = {
   isPackaged: () => ipcRenderer.invoke('app:isPackaged'),
 
   onClipboardChanged: (cb: (list: any[]) => void) => on('clipboard:changed', cb),
+  onSnippetsChanged: (cb: (list: any[]) => void) => on('snippets:changed', cb),
   onVaultChanged: (cb: (docs: any[]) => void) => on('vault:changed', cb),
   onConfigChanged: (cb: (cfg: any) => void) => on('config:changed', cb),
   onWindowShown: (cb: () => void) => on('window:shown', cb),
@@ -100,7 +112,15 @@ const api = {
     }) => void
   ) => on('ai:write', cb),
   aiOnWriteDrop: (cb: (d: { id: string }) => void) => on('ai:write:drop', cb),
-  aiOnDocCreated: (cb: (d: { path: string; title: string }) => void) => on('ai:doc-created', cb)
+  aiOnDocCreated: (cb: (d: { path: string; title: string }) => void) => on('ai:doc-created', cb),
+  aiOnPlan: (cb: (d: { reqId: string; steps: { id: string; text: string; status: string }[] }) => void) =>
+    on('ai:plan', cb),
+  aiOnAsk: (cb: (d: { reqId: string; id: string; question: string; options: { label: string; value: string }[]; multiple: boolean }) => void) =>
+    on('ai:ask', cb),
+  aiOnAskDrop: (cb: (d: { id: string }) => void) => on('ai:ask:drop', cb),
+  aiOnCtx: (cb: (d: { reqId: string; folded?: number; saved?: number; summarized?: boolean }) => void) => on('ai:ctx', cb),
+  aiOnRetry: (cb: (d: { reqId: string; attempt: number; max: number }) => void) => on('ai:retry', cb),
+  aiOnMcp: (cb: (d: { reqId: string; tools: number }) => void) => on('ai:mcp', cb)
 }
 
 contextBridge.exposeInMainWorld('api', api)

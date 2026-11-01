@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Icon } from './Icons'
-import type { AppConfig, ModelProfile } from '../lib/types'
+import type { AppConfig, McpStatus, ModelProfile, SkillDef } from '../lib/types'
 
 interface Props {
   open: boolean
@@ -61,6 +61,21 @@ export default function SettingsDialog({
 }: Props) {
   const [recording, setRecording] = useState(false)
   const [draft, setDraft] = useState(config.hotkey)
+  const [skills, setSkills] = useState<SkillDef[]>([])
+  const [mcpText, setMcpText] = useState('')
+  const [mcpStatus, setMcpStatus] = useState<McpStatus[]>([])
+  const [mcpErr, setMcpErr] = useState('')
+  const [mcpBusy, setMcpBusy] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    window.api.extSkills().then(setSkills).catch(() => undefined)
+    window.api
+      .extMcpConfig()
+      .then((cfg) => setMcpText(JSON.stringify(cfg, null, 2)))
+      .catch(() => undefined)
+    window.api.extMcpStatus().then(setMcpStatus).catch(() => undefined)
+  }, [open])
 
   useEffect(() => setDraft(config.hotkey), [config.hotkey])
   useEffect(() => {
@@ -277,6 +292,112 @@ export default function SettingsDialog({
                 <button className="btn-ghost" onClick={onPickVault}>
                   更换
                 </button>
+              </div>
+            </div>
+          </section>
+
+          <section>
+            <div className="setting-row column">
+              <div className="setting-label">
+                <span>技能包</span>
+                <small>成套的操作手册，AI 命中场景时自己加载。想新增就让 AI「把这套流程存成技能」</small>
+              </div>
+              <div className="ext-list">
+                {skills.length === 0 && <div className="ext-empty">还没有技能包</div>}
+                {skills.map((s) => (
+                  <div className="ext-row" key={s.name}>
+                    <div className="ext-main">
+                      <span className="ext-name">{s.name}</span>
+                      <span className="ext-sub">{s.when || s.description || '—'}</span>
+                    </div>
+                    <button
+                      className="btn-ghost ext-del"
+                      onClick={() =>
+                        window.api.extSkillRemove(s.name).then(() => window.api.extSkills().then(setSkills))
+                      }
+                      title="删除这个技能文件"
+                    >
+                      <Icon name="trash" size={11} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <div className="ext-actions">
+                <button className="btn-ghost" onClick={() => window.api.extSkillReveal()}>
+                  打开技能目录
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section>
+            <div className="setting-row column">
+              <div className="setting-label">
+                <span>MCP 服务</span>
+                <small>
+                  接入外部工具（文件、数据库、搜索）。保存后会启动子进程并拉取工具清单，下一次对话自动可用
+                </small>
+              </div>
+              <textarea
+                className="ext-code"
+                value={mcpText}
+                spellCheck={false}
+                rows={6}
+                placeholder={'{\n  "mcpServers": {\n    "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "D:/notes"] }\n  }\n}'}
+                onChange={(e) => {
+                  setMcpText(e.target.value)
+                  setMcpErr('')
+                }}
+              />
+              <div className="ext-actions">
+                <button
+                  className="btn-primary"
+                  disabled={mcpBusy}
+                  onClick={async () => {
+                    setMcpBusy(true)
+                    setMcpErr('')
+                    try {
+                      const cfg = JSON.parse(mcpText || '{"mcpServers":{}}')
+                      await window.api.extMcpSave(cfg)
+                      setMcpStatus(await window.api.extMcpStatus(true))
+                    } catch (err) {
+                      setMcpErr(`配置不是合法 JSON：${(err as Error).message}`)
+                    } finally {
+                      setMcpBusy(false)
+                    }
+                  }}
+                >
+                  {mcpBusy ? '连接中…' : '保存并连接'}
+                </button>
+                <button
+                  className="btn-ghost"
+                  onClick={() => window.api.extMcpStatus(true).then(setMcpStatus).catch(() => undefined)}
+                >
+                  刷新状态
+                </button>
+              </div>
+              {mcpErr && <div className="setting-warn">{mcpErr}</div>}
+              <div className="ext-list">
+                {mcpStatus.length === 0 && <div className="ext-empty">还没有配置 MCP 服务</div>}
+                {mcpStatus.map((s) => (
+                  <div className="ext-row" key={s.name}>
+                    <span className={`ext-dot is-${s.state}`} />
+                    <div className="ext-main">
+                      <span className="ext-name">{s.name}</span>
+                      <span className="ext-sub">
+                        {s.state === 'ready'
+                          ? `${s.tools} 个工具可用`
+                          : s.state === 'error'
+                            ? s.error || '连接失败'
+                            : s.state === 'disabled'
+                              ? '已停用'
+                              : s.state === 'starting'
+                                ? '正在连接…'
+                                : s.command}
+                      </span>
+                    </div>
+                  </div>
+                ))}
               </div>
             </div>
           </section>

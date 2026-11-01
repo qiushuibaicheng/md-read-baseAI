@@ -50,6 +50,31 @@ export interface AiSessionMessage {
   error?: string
   /** 本次回答期间调用过的工具摘要，例如「读取 排查/502.md」 */
   tools?: string[]
+  /** 面板上展示的执行计划 */
+  plan?: PlanStep[]
+}
+
+export interface PlanStep {
+  id: string
+  text: string
+  status: 'pending' | 'doing' | 'done'
+}
+
+export interface SkillDef {
+  name: string
+  description: string
+  when: string
+  body: string
+  file: string
+}
+
+export interface McpStatus {
+  name: string
+  state: 'idle' | 'starting' | 'ready' | 'error' | 'disabled'
+  tools: number
+  error?: string
+  command: string
+  note?: string
 }
 
 export interface AiSession {
@@ -69,6 +94,8 @@ export interface AiSession {
 export interface WriteProposal {
   id: string
   reqId: string
+  /** 修改提案或删除提案 */
+  kind?: 'write' | 'delete'
   path: string
   title: string
   before: string

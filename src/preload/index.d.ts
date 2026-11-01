@@ -47,6 +47,30 @@ export interface AiSessionMessage {
   usage?: { prompt: number; completion: number }
   error?: string
   tools?: string[]
+  plan?: PlanStep[]
+}
+
+export interface PlanStep {
+  id: string
+  text: string
+  status: 'pending' | 'doing' | 'done'
+}
+
+export interface SkillDef {
+  name: string
+  description: string
+  when: string
+  body: string
+  file: string
+}
+
+export interface McpStatus {
+  name: string
+  state: 'idle' | 'starting' | 'ready' | 'error' | 'disabled'
+  tools: number
+  error?: string
+  command: string
+  note?: string
 }
 
 export interface AiSession {
@@ -68,11 +92,13 @@ export interface AiChatRequest {
   temperature?: number
   maxTokens?: number
   tools?: boolean
+  budget?: number
 }
 
 export interface WriteProposal {
   id: string
   reqId: string
+  kind?: 'write' | 'delete'
   path: string
   title: string
   before: string
@@ -166,8 +192,18 @@ export interface InkAPI {
   aiTitle(payload: { profileId: string; content: string }): Promise<string | null>
   aiSessions(): Promise<AiSession[]>
   aiSaveSessions(list: AiSession[]): Promise<boolean>
-  aiApplyWrite(id: string): Promise<{ ok: boolean; message?: string; path?: string; content?: string; before?: string }>
+  aiApplyWrite(id: string): Promise<{ ok: boolean; message?: string; path?: string; content?: string; before?: string; deleted?: boolean }>
   aiDiscardWrite(id: string): Promise<boolean>
+  aiAnswer(id: string, answer: string): Promise<boolean>
+  extSkills(): Promise<SkillDef[]>
+  extSkillSave(input: { name: string; description?: string; when?: string; body: string }): Promise<SkillDef>
+  extSkillRemove(name: string): Promise<boolean>
+  extSkillReveal(): Promise<boolean>
+  extMcpConfig(): Promise<{ mcpServers: Record<string, any> }>
+  extMcpSave(cfg: { mcpServers: Record<string, any> }): Promise<McpStatus[]>
+  extMcpStatus(reload?: boolean): Promise<McpStatus[]>
+  extMcpTools(): Promise<{ server: string; name: string; description: string }[]>
+  extMcpFile(): Promise<string>
   hide(): Promise<void>
   pin(on: boolean): Promise<boolean>
   toggleMaximize(): Promise<boolean>
@@ -177,6 +213,7 @@ export interface InkAPI {
   openVault(): Promise<void>
   isPackaged(): Promise<boolean>
   onClipboardChanged(cb: (list: ClipItem[]) => void): () => void
+  onSnippetsChanged(cb: (list: Snippet[]) => void): () => void
   onVaultChanged(cb: (docs: DocMeta[]) => void): () => void
   onConfigChanged(cb: (cfg: AppConfig) => void): () => void
   onWindowShown(cb: () => void): () => void
@@ -184,7 +221,9 @@ export interface InkAPI {
   onOpenSettings(cb: () => void): () => void
   onThemeSystem(cb: (dark: boolean) => void): () => void
   aiOnStream(cb: (d: { reqId: string; text: string; reasoning: string }) => void): () => void
-  aiOnDone(cb: (d: { reqId: string; text: string; reasoning: string; usage?: { prompt: number; completion: number } }) => void): () => void
+  aiOnDone(
+    cb: (d: { reqId: string; text: string; reasoning: string; usage?: { prompt: number; completion: number }; plan?: PlanStep[] }) => void
+  ): () => void
   aiOnError(cb: (d: { reqId: string; message: string }) => void): () => void
   aiOnAborted(cb: (d: { reqId: string }) => void): () => void
   aiOnTool(
@@ -192,13 +231,29 @@ export interface InkAPI {
       reqId: string
       name: string
       args?: string
-      status: 'running' | 'done' | 'unsupported'
+      status: 'running' | 'done' | 'error' | 'unsupported'
       preview?: string
+      depth?: number
+      sub?: string
     }) => void
   ): () => void
   aiOnWrite(cb: (d: WriteProposal) => void): () => void
   aiOnWriteDrop(cb: (d: { id: string }) => void): () => void
   aiOnDocCreated(cb: (d: { path: string; title: string }) => void): () => void
+  aiOnPlan(cb: (d: { reqId: string; steps: PlanStep[] }) => void): () => void
+  aiOnAsk(
+    cb: (d: {
+      reqId: string
+      id: string
+      question: string
+      options: { label: string; value: string }[]
+      multiple: boolean
+    }) => void
+  ): () => void
+  aiOnAskDrop(cb: (d: { id: string }) => void): () => void
+  aiOnCtx(cb: (d: { reqId: string; folded?: number; saved?: number; summarized?: boolean }) => void): () => void
+  aiOnRetry(cb: (d: { reqId: string; attempt: number; max: number }) => void): () => void
+  aiOnMcp(cb: (d: { reqId: string; tools: number }) => void): () => void
 }
 
 declare global {

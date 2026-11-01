@@ -19,7 +19,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, watch, FSWatcher } 
 import type { Dirent } from 'fs'
 import * as fsp from 'fs/promises'
 import { pathToFileURL } from 'url'
-import { registerAi } from './ai'
+import { registerAi, shutdownAi } from './ai'
 
 // ---------------------------------------------------------------------------
 // 基础路径
@@ -125,14 +125,25 @@ function notifyConfig() {
 // ---------------------------------------------------------------------------
 function seedVault() {
   const welcome = join(config.vaultPath, '欢迎使用 Inkwell.md')
-  if (existsSync(welcome)) return
+  if (existsSync(welcome)) {
+    // 默认热键改过，老文档里那句说明跟着改一下（只动完全匹配的那一行）
+    try {
+      const old = readFileSync(welcome, 'utf-8')
+      if (old.includes('按下 `Alt + Space`（可在设置里修改）')) {
+        writeFileSync(welcome, old.split('按下 `Alt + Space`（可在设置里修改）').join('按下 `Alt + M`（可在设置里修改）'), 'utf-8')
+      }
+    } catch {
+      /* 改不了就算了，不影响启动 */
+    }
+    return
+  }
   const content = `# 欢迎使用 Inkwell
 
 > 一个为「问题定位」而生的 Markdown 工作台：**随时召出、随手记录、一键复制**。
 
 ## 快捷召出
 
-按下 \`Alt + Space\`（可在设置里修改），窗口立刻出现在光标所在屏幕。
+按下 \`Alt + M\`（可在设置里修改），窗口立刻出现在光标所在屏幕。
 失去焦点会自动收起，不打断你正在做的事。
 
 ## 你可以这样用
@@ -421,6 +432,61 @@ async function arrangeEntry(kind: 'doc' | 'dir', rel: string, targetDir: string,
   if (fromDir !== targetDir) order[fromDir] = await listDirEntries(fromDir)
   config.order = order
   saveConfig()
+  return next
+}
+
+/** Markdown 标题树（跳过代码围栏里的 #） */
+function outlineOf(text: string): { level: number; text: string; line: number }[] {
+  const out: { level: number; text: string; line: number }[] = []
+  let fence = false
+  text.split('\n').forEach((line, i) => {
+    if (/^\s*(```|~~~)/.test(line)) fence = !fence
+    if (fence) return
+    const m = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/)
+    if (m) out.push({ level: m[1].length, text: m[2], line: i + 1 })
+  })
+  return out
+}
+
+/**
+ * AI 用的移动/改名：文档和文件夹共用一条路。
+ * 与拖拽的区别是它可能同时改名，所以路径改写要一次做完（order 键、标签、上次文档）。
+ */
+async function moveEntryAny(from: string, toDir: string, newName?: string): Promise<string> {
+  const abs = safePath(from)
+  if (!existsSync(abs)) throw new Error(`找不到 ${from}`)
+  const stat = await fsp.stat(abs)
+  const isDir = stat.isDirectory()
+  const cleanDir = (toDir || '').trim().replace(/^\.?\//, '').replace(/\/+$/, '')
+  if (isDir && (cleanDir === from || cleanDir.startsWith(`${from}/`))) {
+    throw new Error('不能把文件夹移动到它自己或它的子目录里')
+  }
+  const destDirAbs = cleanDir ? safePath(cleanDir) : config.vaultPath
+  ensureDir(destDirAbs)
+
+  let name = (newName || '').replace(/[\\/:*?"<>|]/g, '').trim()
+  if (!name) name = basename(abs)
+  if (!isDir && !/\.md$/i.test(name)) name += '.md'
+  const dest = join(destDirAbs, name)
+  if (resolve(dest) === resolve(abs)) return from
+  if (existsSync(dest)) throw new Error(`目标位置已有同名${isDir ? '文件夹' : '文档'}「${name}」`)
+
+  await fsp.rename(abs, dest)
+  const next = relOf(dest)
+  const fromDir = dirRelOf(from)
+
+  remapOrder(from, next)
+  remapOpenPaths(from, next)
+  // 原地改名时 remapOrder 已把条目换成新路径且位置不变；跨目录才需要重排两份列表
+  if (fromDir !== cleanDir) {
+    const order = { ...(config.order || {}) }
+    order[fromDir] = (await listDirEntries(fromDir)).filter((p) => p !== from && p !== next)
+    order[cleanDir] = [next, ...(await listDirEntries(cleanDir)).filter((p) => p !== next)]
+    config.order = order
+  }
+  saveConfig()
+  notifyConfig()
+  win?.webContents.send('vault:changed', await scanVault())
   return next
 }
 
@@ -992,8 +1058,50 @@ if (!gotLock) {
         const name = uniqueName(dirAbs, clean)
         const abs = join(dirAbs, name)
         await fsp.writeFile(abs, content.endsWith('\n') ? content : `${content}\n`, 'utf-8')
-        return relative(config.vaultPath, abs).split('\\').join('/')
-      }
+        const rel = relative(config.vaultPath, abs).split('\\').join('/')
+        unshiftOrder(dir || '', rel)
+        win?.webContents.send('vault:changed', await scanVault())
+        return rel
+      },
+      folders: () => scanFolders(),
+      createFolder: async (rel: string) => {
+        const clean = rel.replace(/^\.?\//, '').replace(/\/+$/, '')
+        if (!clean) throw new Error('文件夹名不能为空')
+        const abs = safePath(clean)
+        if (existsSync(abs)) throw new Error(`「${clean}」已存在`)
+        ensureDir(abs)
+        // 逐级登记排序，避免新建的嵌套目录在父级里找不到
+        const parts = clean.split('/')
+        for (let i = 1; i <= parts.length; i++) {
+          const sub = parts.slice(0, i).join('/')
+          unshiftOrder(parts.slice(0, i - 1).join('/'), sub)
+        }
+        win?.webContents.send('vault:changed', await scanVault())
+        return clean
+      },
+      move: (from: string, toDir: string, newName?: string) => moveEntryAny(from, toDir, newName),
+      remove: async (rel: string) => {
+        const abs = safePath(rel)
+        await shell.trashItem(abs)
+        dropFromOrder(rel)
+        win?.webContents.send('vault:changed', await scanVault())
+      },
+      outline: async (rel: string) => outlineOf(await fsp.readFile(safePath(rel), 'utf-8')),
+      snippets: () => readJSON<any[]>(SNIPPET_FILE, []),
+      saveSnippet: (title: string, content: string) => {
+        const list = readJSON<any[]>(SNIPPET_FILE, [])
+        const item = {
+          id: `s-${Date.now().toString(36)}`,
+          title: title.slice(0, 40),
+          content: content.slice(0, 20000),
+          createdAt: Date.now()
+        }
+        const next = [item, ...list.filter((s) => s.title !== item.title)].slice(0, 200)
+        writeJSON(SNIPPET_FILE, next)
+        win?.webContents.send('snippets:changed', next)
+        return item
+      },
+      clips: () => clipHistory.map((c) => ({ text: c.text, time: c.time }))
     }))
     createWindow()
     createTray()
@@ -1021,5 +1129,6 @@ if (!gotLock) {
   app.on('will-quit', () => {
     globalShortcut.unregisterAll()
     watcher?.close()
+    shutdownAi()
   })
 }

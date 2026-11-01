@@ -2,13 +2,54 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRe
 import MessageBody from './MessageBody'
 import { Icon } from './Icons'
 import { SKILLS, buildSystemPrompt, estimateTokens, packContextFiles, unwrapFence } from '../lib/ai'
-import type { AiSession, AiSessionMessage, DocMeta, ModelProfile, WriteProposal } from '../lib/types'
+import type { AiSession, AiSessionMessage, DocMeta, ModelProfile, PlanStep, SkillDef, WriteProposal } from '../lib/types'
 
 const BUDGET_STEPS = [8000, 16000, 32000, 64000, 128000]
 const fmtK = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
 
 const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 const MAX_HISTORY = 12
+
+function parseArgs(raw?: string): Record<string, any> {
+  try {
+    return raw ? JSON.parse(raw) : {}
+  } catch {
+    return {}
+  }
+}
+
+const TOOL_LABEL: Record<string, (a: Record<string, any>) => string> = {
+  list_tree: (a) => (a.dir ? `查看目录 ${a.dir}` : '查看目录结构'),
+  list_docs: (a) => (a.query ? `找文档「${a.query}」` : '列出文档'),
+  read_doc: (a) => `读取 ${a.path || ''}`,
+  search_docs: (a) => `检索「${a.query || ''}」`,
+  get_outline: (a) => `看大纲 ${a.path || ''}`,
+  list_snippets: () => '查看片段库',
+  list_clips: () => '查看剪贴板',
+  fetch_url: (a) => `读网页 ${String(a.url || '').slice(0, 36)}`,
+  create_doc: (a) => `新建《${a.title || ''}》`,
+  edit_doc: (a) => `修改 ${a.path || ''}`,
+  create_folder: (a) => `新建文件夹 ${a.name || ''}`,
+  move_entry: (a) => `移动 ${a.path || ''}`,
+  delete_entry: (a) => `删除 ${a.path || ''}`,
+  replace_in_docs: (a) => `批量替换 ${Array.isArray(a.paths) ? a.paths.length : 0} 篇`,
+  save_snippet: (a) => `存片段 ${a.title || ''}`,
+  todo_write: () => '更新执行计划',
+  ask_user: () => '向你确认',
+  delegate: (a) => `派${a.role === 'writer' ? '写作者' : a.role === 'reviewer' ? '审校者' : '研究员'}`,
+  list_skills: () => '查看技能包',
+  load_skill: (a) => `加载技能 ${a.name || ''}`,
+  create_skill: (a) => `新建技能 ${a.name || ''}`
+}
+
+function toolLabel(name: string, rawArgs?: string): string {
+  if (name.startsWith('mcp__')) {
+    const parts = name.split('__')
+    return `MCP · ${parts[1] || ''} / ${parts.slice(2).join('_')}`
+  }
+  const meta = TOOL_LABEL[name]
+  return meta ? meta(parseArgs(rawArgs)) : name
+}
 
 export interface AiPanelHandle {
   runSkill: (id: string, input?: string) => void
@@ -40,6 +81,8 @@ interface Props {
   onNewDoc: (title: string, content: string) => void
   onCopy: (text: string, label?: string) => void
   onToast: (msg: string) => void
+  /** 读取编辑器当前光标（path 与字符偏移），用于把「光标在哪」告诉模型 */
+  readCaret?: () => { path: string | null; start: number }
 }
 
 export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
@@ -66,7 +109,8 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
     onReplaceDoc,
     onNewDoc,
     onCopy,
-    onToast
+    onToast,
+    readCaret
   } = props
 
   const [sessions, setSessions] = useState<AiSession[]>([])
@@ -97,6 +141,9 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
   }, [modelCtx])
   const budgetUsed = Math.min(budget, budgetSteps[budgetSteps.length - 1])
   const [toolNote, setToolNote] = useState<string | null>(null)
+  const [ask, setAsk] = useState<{ id: string; question: string; options: { label: string; value: string }[]; multiple: boolean } | null>(null)
+  const [skills, setSkills] = useState<SkillDef[]>([])
+  const [mcpCount, setMcpCount] = useState(0)
 
   const listRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
@@ -117,6 +164,7 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
       setSessions(list)
       if (list.length) setSessionId(list[0].id)
     })
+    window.api.extSkills().then(setSkills).catch(() => undefined)
   }, [open, loaded])
 
   const persist = useCallback((next: AiSession[]) => {
@@ -235,7 +283,8 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
         patchMessage(target.sessionId, target.messageId, {
           content: d.text,
           reasoning: d.reasoning,
-          usage: d.usage
+          usage: d.usage,
+          ...(d.plan && d.plan.length ? { plan: d.plan } : {})
         })
         pending.current.delete(d.reqId)
         setLive(null)
@@ -258,40 +307,53 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
       }),
       window.api.aiOnTool((d) => {
         if (d.status === 'unsupported') {
-          setToolNote('当前模型不支持读取文档，本次只用了已带入的内容')
+          setToolNote('当前模型不支持工具调用，本次只用了已带入的内容')
           return
         }
         if (!d.name) return
-        let detail = ''
-        try {
-          const args = JSON.parse(d.args || '{}')
-          detail = String(args.path || args.query || '')
-        } catch {
-          /* ignore */
+        const label = toolLabel(d.name, d.args)
+        const prefix = d.depth ? '↳ ' : ''
+        if (d.status === 'running') {
+          setToolNote(d.sub ? `${label}（${d.sub}）中…` : `${label} 中…`)
+          return
         }
-        const label =
-          d.name === 'read_doc'
-            ? `读取 ${detail}`
-            : d.name === 'search_docs'
-              ? `检索「${detail}」`
-              : d.name === 'create_doc'
-                ? `新建 ${detail}`
-                : d.name === 'edit_doc'
-                  ? `修改 ${detail}`
-                  : '列出文档'
-        setToolNote(d.status === 'running' ? `${label} 中…` : `已${label}`)
+        setToolNote(d.status === 'error' ? `${label} 失败` : `${label} 完成`)
 
-        if (d.status === 'done') {
+        if (d.status === 'done' || d.status === 'error') {
           const target = pending.current.get(d.reqId)
           if (target) {
             mutateSession(target.sessionId, (s) => ({
               ...s,
               messages: s.messages.map((m) =>
-                m.id === target.messageId ? { ...m, tools: [...(m.tools || []), label] } : m
+                m.id === target.messageId
+                  ? { ...m, tools: [...(m.tools || []), d.status === 'error' ? `${label}（失败）` : `${prefix}${label}`] }
+                  : m
               )
             }))
           }
         }
+      }),
+      window.api.aiOnPlan((d) => {
+        const target = pending.current.get(d.reqId)
+        if (!target) return
+        patchMessage(target.sessionId, target.messageId, { plan: d.steps as PlanStep[] })
+        scrollToBottom()
+      }),
+      window.api.aiOnAsk((d) => {
+        setAsk({ id: d.id, question: d.question, options: d.options, multiple: d.multiple })
+      }),
+      window.api.aiOnAskDrop((d) => {
+        setAsk((cur) => (cur && cur.id === d.id ? null : cur))
+      }),
+      window.api.aiOnCtx((d) => {
+        setToolNote(d.summarized ? '上下文过长，已把早期对话压缩成摘要' : `已折叠 ${d.folded || 0} 轮早期对话`)
+      }),
+      window.api.aiOnRetry((d) => {
+        setToolNote(`网络中断，正在重试（${d.attempt}/${d.max}）`)
+      }),
+      window.api.aiOnMcp((d) => {
+        setMcpCount(d.tools)
+        if (d.tools) setToolNote(`已接入 ${d.tools} 个 MCP 工具`)
       })
     ]
     return () => offs.forEach((off) => off())
@@ -354,14 +416,24 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
           else picked.unshift(self)
         }
         const packed = packContextFiles(picked, budgetUsed)
+        const skillText = skills.length
+          ? skills.map((s) => `- ${s.name}${s.when ? ` — 适用：${s.when}` : s.description ? ` — ${s.description}` : ''}`).join('\n')
+          : ''
+        const caret = readCaret?.()
+        const cursorHint =
+          caret && docPath && caret.path === docPath && caret.start >= 0
+            ? `用户光标在《${docTitle || '当前文档'}》第 ${caret.start + 1} 个字符处。`
+            : ''
         const system = buildSystemPrompt({
           selection: attachSelection && selection ? selection : '',
           contextFiles: packed,
-          // 只有明确挑过文档时才把全库清单塞进去，普通问答不浪费上下文
+          // 工具能自己查目录，全库清单只在用户明确挑过文档时给，省上下文
           library:
             contextPaths.length && docList.length
               ? docList.map((d) => ({ path: d.path, title: d.title, size: d.size }))
-              : undefined
+              : undefined,
+          skills: skillText,
+          extra: cursorHint || undefined
         })
 
         await window.api.aiChat({
@@ -369,7 +441,8 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
           profileId: activeModel.id,
           system,
           messages: [...history, { role: 'user', content }],
-          tools: true
+          tools: true,
+          budget: budgetUsed
         })
       } catch (err) {
         patchMessage(current.id, assistantId, { error: String((err as Error)?.message || err) })
@@ -394,7 +467,9 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
       budgetUsed,
       docList,
       readContextFiles,
-      scrollToBottom
+      scrollToBottom,
+      skills,
+      readCaret
     ]
   )
 
@@ -592,6 +667,12 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
               <br />
               需要多篇一起看时，点下方「上下文」挑给 AI。
             </p>
+            {skills.length > 0 && (
+              <p className="ai-empty-skills">
+                技能包：{skills.slice(0, 4).map((s) => s.name).join('、')}
+                {skills.length > 4 ? ` 等 ${skills.length} 个` : ''}
+              </p>
+            )}
             <div className="skill-grid">
               {SKILLS.map((s) => (
                 <button key={s.id} className="skill-card" onClick={() => send(s.build({ docTitle, docContent, selection: selection || '' }, ''), { display: s.label })}>
@@ -621,11 +702,44 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
                   )}
                 </div>
 
-                {m.tools?.length ? (
-                  <div className="ai-tools-used">
-                    <Icon name="folder" size={11} />
-                    <span>{m.tools.join(' · ')}</span>
+                {m.plan && m.plan.length > 0 && (
+                  <div className="ai-plan">
+                    <div className="ai-plan-head">
+                      <Icon name="check" size={11} />
+                      <span>
+                        执行计划 {m.plan.filter((s) => s.status === 'done').length}/{m.plan.length}
+                      </span>
+                    </div>
+                    <ol className="ai-plan-list">
+                      {m.plan.map((s) => (
+                        <li key={s.id} className={`is-${s.status}`}>
+                          <span className="ai-plan-mark">
+                            {s.status === 'done' ? <Icon name="check" size={9} /> : s.status === 'doing' ? <i /> : null}
+                          </span>
+                          <span>{s.text}</span>
+                        </li>
+                      ))}
+                    </ol>
                   </div>
+                )}
+
+                {m.tools?.length ? (
+                  <details className="ai-tools-used">
+                    <summary>
+                      <Icon name="folder" size={11} />
+                      <span>
+                        {m.tools.slice(0, 3).join(' · ')}
+                        {m.tools.length > 3 ? ` 等 ${m.tools.length} 步` : ''}
+                      </span>
+                    </summary>
+                    <div className="ai-tools-all">
+                      {m.tools.map((t, ti) => (
+                        <span key={`${t}-${ti}`} className={t.startsWith('↳') ? 'is-sub' : ''}>
+                          {t}
+                        </span>
+                      ))}
+                    </div>
+                  </details>
                 ) : null}
 
                 {m.reasoning ? (
@@ -690,25 +804,55 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
       </div>
 
       <div className="ai-composer">
+        {ask && (
+          <div className="ai-ask">
+            <div className="ai-ask-q">{ask.question}</div>
+            <div className="ai-ask-opts">
+              {ask.options.map((o) => (
+                <button
+                  key={o.value}
+                  onClick={() => {
+                    window.api.aiAnswer(ask.id, o.value)
+                    setAsk(null)
+                  }}
+                >
+                  {o.label}
+                </button>
+              ))}
+              <button
+                className="ai-ask-skip"
+                onClick={() => {
+                  window.api.aiAnswer(ask.id, '（用户跳过了这个问题，请按你的判断继续）')
+                  setAsk(null)
+                }}
+              >
+                跳过
+              </button>
+            </div>
+          </div>
+        )}
+
         {writes.length > 0 && (
           <div className="ai-writes">
             {writes.map((w) => (
-              <div className="ai-write" key={w.id}>
+              <div className={`ai-write${w.kind === 'delete' ? ' is-delete' : ''}`} key={w.id}>
                 <div className="ai-write-main">
-                  <Icon name="pencil" size={11} />
+                  <Icon name={w.kind === 'delete' ? 'trash' : 'pencil'} size={11} />
                   <span className="ai-write-title" title={w.path}>
-                    建议修改《{w.title}》
+                    {w.kind === 'delete' ? `删除《${w.title}》` : `建议修改《${w.title}》`}
                   </span>
                   <span className="ai-write-stat">
-                    <em>+{w.add}</em> −{w.del}
+                    {w.kind === 'delete' ? <em className="is-del">进回收站</em> : <><em>+{w.add}</em> −{w.del}</>}
                   </span>
                 </div>
                 <div className="ai-write-actions">
-                  <button onClick={() => onPreviewWrite(w.id)} title="先看 diff 再决定">
-                    看 diff
-                  </button>
-                  <button className="is-primary" onClick={() => onApplyWrite(w.id)} title="写入磁盘，可用 Ctrl+Z 撤回">
-                    应用
+                  {w.kind !== 'delete' && (
+                    <button onClick={() => onPreviewWrite(w.id)} title="先看 diff 再决定">
+                      看 diff
+                    </button>
+                  )}
+                  <button className={w.kind === 'delete' ? 'is-danger' : 'is-primary'} onClick={() => onApplyWrite(w.id)}>
+                    {w.kind === 'delete' ? '确认删除' : '应用'}
                   </button>
                   <button onClick={() => onDiscardWrite(w.id)}>忽略</button>
                 </div>

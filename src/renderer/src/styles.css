@@ -1865,6 +1865,93 @@ kbd {
   color: var(--txt-3);
 }
 
+/* 设置页：扩展能力（技能包 / MCP） */
+.ext-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.ext-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel-2, rgba(127, 127, 127, 0.05));
+}
+.ext-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.ext-name {
+  font-size: 12px;
+  color: var(--txt);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ext-sub {
+  font-size: 11px;
+  color: var(--txt-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ext-del {
+  height: 20px;
+  padding: 0 5px;
+  color: var(--txt-3);
+}
+.ext-del:hover {
+  color: var(--danger);
+}
+.ext-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--txt-3);
+}
+.ext-dot.is-ready {
+  background: #2fa36b;
+}
+.ext-dot.is-error {
+  background: #c94a4a;
+}
+.ext-dot.is-starting {
+  background: #d79a2b;
+}
+.ext-empty {
+  font-size: 11px;
+  color: var(--txt-3);
+  padding: 2px 0;
+}
+.ext-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+.ext-code {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel-2, rgba(127, 127, 127, 0.05));
+  color: var(--txt);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  resize: vertical;
+}
+.ext-code:focus {
+  outline: none;
+  border-color: var(--acc);
+}
+
 .setting-warn {
   font-size: 11px;
   color: var(--danger);
@@ -2710,6 +2797,145 @@ kbd {
   background: var(--acc);
   border-color: transparent;
   filter: brightness(1.08);
+}
+
+/* 删除提案：跟修改提案在颜色上要一眼分开 */
+.ai-write.is-delete {
+  border-color: rgba(220, 80, 80, 0.35);
+  background: rgba(220, 80, 80, 0.06);
+}
+.ai-write.is-delete .ai-write-main svg {
+  color: #c94a4a;
+}
+.ai-write-stat em.is-del {
+  color: #c94a4a;
+}
+:root[data-theme='dark'] .ai-write-stat em.is-del {
+  color: #ef8a8a;
+}
+.ai-write-actions button.is-danger {
+  color: #fff;
+  background: #c94a4a;
+}
+.ai-write-actions button.is-danger:hover {
+  color: #fff;
+  background: #c94a4a;
+  border-color: transparent;
+  filter: brightness(1.08);
+}
+
+.ai-empty-skills {
+  font-size: 11px;
+  color: var(--txt-3);
+  margin-top: 2px;
+}
+
+/* 执行计划 */
+.ai-plan {
+  margin: 2px 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-2, rgba(127, 127, 127, 0.05));
+}
+.ai-plan-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--txt-3);
+  margin-bottom: 6px;
+}
+.ai-plan-head svg {
+  color: var(--acc);
+}
+.ai-plan-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: step;
+}
+.ai-plan-list li {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--txt-2);
+}
+.ai-plan-list li.is-done {
+  color: var(--txt-3);
+  text-decoration: line-through;
+  text-decoration-color: var(--line-strong, rgba(127, 127, 127, 0.4));
+}
+.ai-plan-list li.is-doing {
+  color: var(--txt);
+}
+.ai-plan-mark {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  margin-top: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  color: var(--acc);
+}
+.ai-plan-list li.is-done .ai-plan-mark {
+  border-color: var(--acc);
+  background: var(--acc-soft);
+}
+.ai-plan-list li.is-doing .ai-plan-mark {
+  border-color: var(--acc);
+}
+.ai-plan-list li.is-doing .ai-plan-mark i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--acc);
+}
+
+/* 提问卡片 */
+.ai-ask {
+  margin-bottom: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--acc-line);
+  border-radius: 10px;
+  background: var(--acc-soft);
+}
+.ai-ask-q {
+  font-size: 12.5px;
+  color: var(--txt);
+  line-height: 1.55;
+  margin-bottom: 7px;
+}
+.ai-ask-opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.ai-ask-opts button {
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid var(--acc-line);
+  background: var(--panel);
+  color: var(--txt-2);
+  font-size: 11.5px;
+}
+.ai-ask-opts button:hover {
+  border-color: var(--acc);
+  color: var(--txt);
+}
+.ai-ask-opts button.ai-ask-skip {
+  border-color: transparent;
+  background: transparent;
+  color: var(--txt-3);
 }
 
 /* 输入区 */
@@ -4193,9 +4419,7 @@ kbd {
 }
 
 .ai-tools-used {
-  display: flex;
-  align-items: center;
-  gap: 5px;
+  display: block;
   margin: 0 0 7px;
   padding: 4px 8px;
   border-radius: var(--r-sm);
@@ -4203,6 +4427,37 @@ kbd {
   background: var(--panel-hover);
   color: var(--txt-3);
   font-size: 11px;
+}
+.ai-tools-used > summary {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  list-style: none;
+  line-height: 1.5;
+}
+.ai-tools-used > summary::-webkit-details-marker {
+  display: none;
+}
+.ai-tools-used > summary span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ai-tools-all {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--line);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+.ai-tools-all span.is-sub {
+  padding-left: 11px;
+  color: var(--txt-4, var(--txt-3));
 }
 .ai-tool-note {
   display: flex;
