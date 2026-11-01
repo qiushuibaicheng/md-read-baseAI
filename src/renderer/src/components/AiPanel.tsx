@@ -2,7 +2,7 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRe
 import MessageBody from './MessageBody'
 import { Icon } from './Icons'
 import { SKILLS, buildSystemPrompt, estimateTokens, packContextFiles, unwrapFence } from '../lib/ai'
-import type { AiSession, AiSessionMessage, DocMeta, ModelProfile } from '../lib/types'
+import type { AiSession, AiSessionMessage, DocMeta, ModelProfile, WriteProposal } from '../lib/types'
 
 const BUDGET_STEPS = [8000, 16000, 32000, 64000, 128000]
 const fmtK = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
@@ -32,6 +32,10 @@ interface Props {
   onManageModels: () => void
   onInsert: (text: string) => void
   onInsertAtCursor: (text: string) => void
+  writes: WriteProposal[]
+  onApplyWrite: (id: string) => void
+  onDiscardWrite: (id: string) => void
+  onPreviewWrite: (id: string) => void
   onReplaceDoc: (text: string) => void
   onNewDoc: (title: string, content: string) => void
   onCopy: (text: string, label?: string) => void
@@ -55,6 +59,10 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
     onManageModels,
     onInsert,
     onInsertAtCursor,
+    writes,
+    onApplyWrite,
+    onDiscardWrite,
+    onPreviewWrite,
     onReplaceDoc,
     onNewDoc,
     onCopy,
@@ -81,6 +89,13 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
     setBudgetState(v)
     localStorage.setItem('inkwell.ctxBudget', String(v))
   }, [])
+  // 上下文预算不能超过模型自己的窗口，否则打包出来的内容会被服务端截断
+  const modelCtx = models.find((m) => m.id === activeModelId)?.maxContext || 128000
+  const budgetSteps = useMemo(() => {
+    const fit = BUDGET_STEPS.filter((s) => s <= modelCtx)
+    return fit.length ? fit : [Math.max(4000, Math.min(modelCtx, 8000))]
+  }, [modelCtx])
+  const budgetUsed = Math.min(budget, budgetSteps[budgetSteps.length - 1])
   const [toolNote, setToolNote] = useState<string | null>(null)
 
   const listRef = useRef<HTMLDivElement | null>(null)
@@ -259,7 +274,11 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
             ? `读取 ${detail}`
             : d.name === 'search_docs'
               ? `检索「${detail}」`
-              : '列出文档'
+              : d.name === 'create_doc'
+                ? `新建 ${detail}`
+                : d.name === 'edit_doc'
+                  ? `修改 ${detail}`
+                  : '列出文档'
         setToolNote(d.status === 'running' ? `${label} 中…` : `已${label}`)
 
         if (d.status === 'done') {
@@ -334,7 +353,7 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
           if (idx >= 0) picked[idx] = self
           else picked.unshift(self)
         }
-        const packed = packContextFiles(picked, budget)
+        const packed = packContextFiles(picked, budgetUsed)
         const system = buildSystemPrompt({
           selection: attachSelection && selection ? selection : '',
           contextFiles: packed,
@@ -372,7 +391,7 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
       onToast,
       patchMessage,
       contextPaths,
-      budget,
+      budgetUsed,
       docList,
       readContextFiles,
       scrollToBottom
@@ -671,6 +690,33 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
       </div>
 
       <div className="ai-composer">
+        {writes.length > 0 && (
+          <div className="ai-writes">
+            {writes.map((w) => (
+              <div className="ai-write" key={w.id}>
+                <div className="ai-write-main">
+                  <Icon name="pencil" size={11} />
+                  <span className="ai-write-title" title={w.path}>
+                    建议修改《{w.title}》
+                  </span>
+                  <span className="ai-write-stat">
+                    <em>+{w.add}</em> −{w.del}
+                  </span>
+                </div>
+                <div className="ai-write-actions">
+                  <button onClick={() => onPreviewWrite(w.id)} title="先看 diff 再决定">
+                    看 diff
+                  </button>
+                  <button className="is-primary" onClick={() => onApplyWrite(w.id)} title="写入磁盘，可用 Ctrl+Z 撤回">
+                    应用
+                  </button>
+                  <button onClick={() => onDiscardWrite(w.id)}>忽略</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
         {selection && attachSelection && (
           <div className={`ai-sel${selOpen ? ' is-open' : ''}`}>
             <button className="ai-sel-head" onClick={() => setSelOpen((v) => !v)} title="展开 / 收起选中的原文">
@@ -745,12 +791,12 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
                 <input
                   type="range"
                   min={0}
-                  max={BUDGET_STEPS.length - 1}
+                  max={budgetSteps.length - 1}
                   step={1}
-                  value={Math.max(0, BUDGET_STEPS.indexOf(budget))}
-                  onChange={(e) => setBudget(BUDGET_STEPS[Number(e.target.value)])}
+                  value={Math.max(0, budgetSteps.indexOf(budgetUsed))}
+                  onChange={(e) => setBudget(budgetSteps[Number(e.target.value)])}
                 />
-                <b>{fmtK(budget)}</b>
+                <b>{fmtK(budgetUsed)}</b>
               </div>
               <button
                 className="btn-primary"

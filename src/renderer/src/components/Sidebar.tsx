@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Icon } from './Icons'
 import { relativeTime } from '../lib/markdown'
 import type { ClipItem, DocMeta, Snippet, ViewKey } from '../lib/types'
@@ -14,6 +14,10 @@ interface Props {
   onNew: (dir?: string) => void
   folders: string[]
   onNewFolder: (parent: string | undefined, name: string) => Promise<boolean>
+  onMove: (path: string, targetDir: string) => void
+  onRevealFolder: (rel: string) => void
+  onRenameFolder: (rel: string, name: string) => void
+  onDeleteFolder: (rel: string) => void
   onDelete: (path: string) => void
   onRename: (path: string, name: string) => void
   onReveal: (path: string) => void
@@ -28,6 +32,14 @@ interface Props {
   vaultPath: string
   onOpenSettings: () => void
 }
+
+const dirOf = (path: string) => {
+  const cut = path.lastIndexOf('/')
+  return cut >= 0 ? path.slice(0, cut) : ''
+}
+const baseName = (path: string) => path.slice(path.lastIndexOf('/') + 1)
+const depthOf = (path: string) => path.split('/').length - 1
+
 
 const TABS: { key: ViewKey; label: string; icon: string }[] = [
   { key: 'notes', label: '文档', icon: 'doc' },
@@ -46,7 +58,34 @@ export default function Sidebar(props: Props) {
   const [newMenu, setNewMenu] = useState(false)
   const [newFolderIn, setNewFolderIn] = useState<string | null>(null)
   const [folderDraft, setFolderDraft] = useState('')
+  /** 正在拖的文档路径 / 当前悬停的落点（'' 表示根目录） */
+  const [dragPath, setDragPath] = useState<string | null>(null)
+  const [dropDir, setDropDir] = useState<string | null>(null)
+  const [moveMenu, setMoveMenu] = useState<{ path: string; x: number; y: number } | null>(null)
+  const [folderMenu, setFolderMenu] = useState<{ path: string; x: number; y: number } | null>(null)
+  const [renamingFolder, setRenamingFolder] = useState<string | null>(null)
+  const [folderRenameDraft, setFolderRenameDraft] = useState('')
   const snippetRef = useRef<HTMLTextAreaElement | null>(null)
+
+  const activeDir = active ? dirOf(active) : ''
+
+  // 打开文档时把它所在的文件夹展开，否则侧栏里根本看不见当前文件
+  useEffect(() => {
+    if (!active || !activeDir) return
+    const parts = activeDir.split('/')
+    const chain: string[] = []
+    parts.reduce((acc, p) => {
+      const next = acc ? `${acc}/${p}` : p
+      chain.push(next)
+      return next
+    }, '')
+    setCollapsed((prev) => {
+      if (!chain.some((p) => prev.has(p))) return prev
+      const next = new Set(prev)
+      chain.forEach((p) => next.delete(p))
+      return next
+    })
+  }, [active, activeDir])
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -124,10 +163,20 @@ export default function Sidebar(props: Props) {
   const renderDoc = (doc: DocMeta, depth: number) => (
     <div
       key={doc.path}
-      className={`doc-item${active === doc.path ? ' is-active' : ''}`}
+      className={`doc-item${active === doc.path ? ' is-active' : ''}${dragPath === doc.path ? ' is-dragging' : ''}`}
       style={depth ? { paddingLeft: 10 + depth * 13 } : undefined}
       onClick={() => props.onOpen(doc.path)}
       onDoubleClick={() => startRename(doc)}
+      draggable
+      onDragStart={(e) => {
+        setDragPath(doc.path)
+        e.dataTransfer.effectAllowed = 'move'
+        e.dataTransfer.setData('text/plain', doc.path)
+      }}
+      onDragEnd={() => {
+        setDragPath(null)
+        setDropDir(null)
+      }}
       title={doc.path}
     >
       <div className="doc-icon">
@@ -167,6 +216,21 @@ export default function Sidebar(props: Props) {
           }}
         >
           <Icon name="pencil" size={12} />
+        </button>
+        <button
+          className="icon-btn tiny"
+          title="移动到文件夹"
+          onClick={(e) => {
+            e.stopPropagation()
+            const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+            setMoveMenu({
+              path: doc.path,
+              x: Math.min(rect.left - 150, window.innerWidth - 216),
+              y: Math.min(rect.bottom + 4, window.innerHeight - 320)
+            })
+          }}
+        >
+          <Icon name="move" size={12} />
         </button>
         <button
           className="icon-btn tiny"
@@ -219,19 +283,68 @@ export default function Sidebar(props: Props) {
     <>
       {node.children.map((child) => {
         const open = !collapsed.has(child.path)
+        const isDrop = dropDir === child.path && !!dragPath
+        const holdsActive = activeDir === child.path || activeDir.startsWith(`${child.path}/`)
         return (
           <div key={child.path} className="folder-block">
             <div
-              className={`folder-row${open ? ' is-open' : ''}`}
+              className={`folder-row${open ? ' is-open' : ''}${isDrop ? ' is-drop' : ''}${
+                holdsActive ? ' has-active' : ''
+              }`}
               style={{ paddingLeft: 8 + depth * 13 }}
               onClick={() => toggleFolder(child.path)}
-              title={child.path}
+              onContextMenu={(e) => {
+                e.preventDefault()
+                e.stopPropagation()
+                setFolderMenu({
+                  path: child.path,
+                  x: Math.min(e.clientX, window.innerWidth - 200),
+                  y: Math.min(e.clientY, window.innerHeight - 220)
+                })
+              }}
+              onDragOver={(e) => {
+                if (!dragPath) return
+                e.preventDefault()
+                e.stopPropagation()
+                e.dataTransfer.dropEffect = 'move'
+                setDropDir(child.path)
+              }}
+              onDrop={(e) => {
+                e.preventDefault()
+                e.stopPropagation()
+                const moving = dragPath || e.dataTransfer.getData('text/plain')
+                setDragPath(null)
+                setDropDir(null)
+                if (moving) props.onMove(moving, child.path)
+              }}
+              title={`${child.path}（可以把文档拖进来）`}
             >
               <span className="folder-caret">
                 <Icon name="chevron" size={11} />
               </span>
               <Icon name="folder" size={13} />
-              <span className="folder-name">{child.name}</span>
+              {renamingFolder === child.path ? (
+                <input
+                  className="rename-input"
+                  autoFocus
+                  value={folderRenameDraft}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={(e) => setFolderRenameDraft(e.target.value)}
+                  onBlur={() => {
+                    if (folderRenameDraft.trim()) props.onRenameFolder(child.path, folderRenameDraft.trim())
+                    setRenamingFolder(null)
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      if (folderRenameDraft.trim()) props.onRenameFolder(child.path, folderRenameDraft.trim())
+                      setRenamingFolder(null)
+                    }
+                    if (e.key === 'Escape') setRenamingFolder(null)
+                  }}
+                />
+              ) : (
+                <span className="folder-name">{child.name}</span>
+              )}
               <span className="folder-count">{countDocs(child)}</span>
               <span className="folder-actions">
                 <button
@@ -239,6 +352,11 @@ export default function Sidebar(props: Props) {
                   title="在此新建文档"
                   onClick={(e) => {
                     e.stopPropagation()
+                    setCollapsed((prev) => {
+                      const next = new Set(prev)
+                      next.delete(child.path)
+                      return next
+                    })
                     props.onNew(child.path)
                   }}
                 >
@@ -255,13 +373,22 @@ export default function Sidebar(props: Props) {
                 >
                   <Icon name="folder-plus" size={11} />
                 </button>
+                <button
+                  className="icon-btn tiny"
+                  title="在资源管理器中打开"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    props.onRevealFolder(child.path)
+                  }}
+                >
+                  <Icon name="external" size={11} />
+                </button>
               </span>
             </div>
             {open && (
               <>
                 {newFolderIn === child.path && renderFolderInput(child.path, depth + 1)}
                 {renderFolder(child, depth + 1)}
-                {child.docs.map((d) => renderDoc(d, depth + 1))}
               </>
             )}
           </div>
@@ -314,19 +441,21 @@ export default function Sidebar(props: Props) {
                     <button
                       onClick={() => {
                         setNewMenu(false)
-                        props.onNew()
+                        props.onNew(activeDir || undefined)
                       }}
                     >
                       <Icon name="doc" size={12} /> 新建文档
+                      {activeDir && <em>{baseName(activeDir)}</em>}
                     </button>
                     <button
                       onClick={() => {
                         setNewMenu(false)
                         setFolderDraft('')
-                        setNewFolderIn('')
+                        setNewFolderIn(activeDir || '')
                       }}
                     >
                       <Icon name="folder-plus" size={12} /> 新建文件夹
+                      {activeDir && <em>{baseName(activeDir)}</em>}
                     </button>
                   </div>
                 </>
@@ -334,10 +463,31 @@ export default function Sidebar(props: Props) {
             </div>
           </div>
 
-          <div className="list">
+          <div
+            className={`list${dragPath ? ' is-dragging-src' : ''}${dropDir === '' && dragPath ? ' is-drop-root' : ''}`}
+            onDragOver={(e) => {
+              if (!dragPath) return
+              e.preventDefault()
+              e.dataTransfer.dropEffect = 'move'
+              setDropDir('')
+            }}
+            onDrop={(e) => {
+              if (!dragPath) return
+              e.preventDefault()
+              const moving = dragPath
+              setDragPath(null)
+              setDropDir(null)
+              props.onMove(moving, '')
+            }}
+          >
             {newFolderIn === '' && renderFolderInput('', 0)}
             {filtered.length === 0 && props.folders.length === 0 && <div className="empty-hint">没有匹配的文档</div>}
             {renderFolder(tree, 0)}
+            {dragPath && (
+              <div className="root-drop-hint">
+                <Icon name="folder" size={12} /> 拖到空白处 = 移到根目录
+              </div>
+            )}
           </div>
         </>
       )}
@@ -472,14 +622,116 @@ export default function Sidebar(props: Props) {
       )}
 
       <div className="sidebar-foot">
-        <button className="vault-btn" onClick={props.onOpenSettings} title={props.vaultPath}>
+        <button className="vault-btn" onClick={props.onOpenSettings} title={`${props.vaultPath}（点击打开设置）`}>
           <Icon name="folder" size={13} />
           <span>{props.vaultPath.split(/[\\/]/).filter(Boolean).pop() || 'Inkwell'}</span>
+        </button>
+        <button className="icon-btn" onClick={() => props.onRevealFolder('')} title="在资源管理器中打开笔记目录">
+          <Icon name="external" size={14} />
         </button>
         <button className="icon-btn" onClick={props.onOpenSettings} title="设置 (Ctrl+,)">
           <Icon name="settings" size={15} />
         </button>
       </div>
+
+      {moveMenu && (
+        <>
+          <div className="menu-backdrop" onClick={() => setMoveMenu(null)} />
+          <div className="side-menu" style={{ left: moveMenu.x, top: moveMenu.y }}>
+            <div className="side-menu-title">移动到</div>
+            <button
+              disabled={dirOf(moveMenu.path) === ''}
+              onClick={() => {
+                const p = moveMenu.path
+                setMoveMenu(null)
+                props.onMove(p, '')
+              }}
+            >
+              <Icon name="doc" size={12} /> 根目录
+              {dirOf(moveMenu.path) === '' && <em>当前</em>}
+            </button>
+            {props.folders.map((f) => (
+              <button
+                key={f}
+                disabled={dirOf(moveMenu.path) === f}
+                style={{ paddingLeft: 12 + depthOf(f) * 10 }}
+                onClick={() => {
+                  const p = moveMenu.path
+                  setMoveMenu(null)
+                  props.onMove(p, f)
+                }}
+              >
+                <Icon name="folder" size={12} /> {baseName(f)}
+                {dirOf(moveMenu.path) === f && <em>当前</em>}
+              </button>
+            ))}
+            {props.folders.length === 0 && <div className="side-menu-empty">还没有文件夹，先在右上角 ＋ 里新建</div>}
+          </div>
+        </>
+      )}
+
+      {folderMenu && (
+        <>
+          <div className="menu-backdrop" onClick={() => setFolderMenu(null)} />
+          <div className="side-menu" style={{ left: folderMenu.x, top: folderMenu.y }}>
+            <div className="side-menu-title">{baseName(folderMenu.path)}</div>
+            <button
+              onClick={() => {
+                const p = folderMenu.path
+                setFolderMenu(null)
+                setCollapsed((prev) => {
+                  const next = new Set(prev)
+                  next.delete(p)
+                  return next
+                })
+                props.onNew(p)
+              }}
+            >
+              <Icon name="plus" size={12} /> 新建文档
+            </button>
+            <button
+              onClick={() => {
+                setFolderDraft('')
+                setNewFolderIn(folderMenu.path)
+                setCollapsed((prev) => {
+                  const next = new Set(prev)
+                  next.delete(folderMenu!.path)
+                  return next
+                })
+                setFolderMenu(null)
+              }}
+            >
+              <Icon name="folder-plus" size={12} /> 新建子文件夹
+            </button>
+            <button
+              onClick={() => {
+                setFolderRenameDraft(baseName(folderMenu.path))
+                setRenamingFolder(folderMenu.path)
+                setFolderMenu(null)
+              }}
+            >
+              <Icon name="pencil" size={12} /> 重命名
+            </button>
+            <button
+              onClick={() => {
+                props.onRevealFolder(folderMenu.path)
+                setFolderMenu(null)
+              }}
+            >
+              <Icon name="external" size={12} /> 在资源管理器中打开
+            </button>
+            <button
+              className="danger"
+              onClick={() => {
+                props.onDeleteFolder(folderMenu.path)
+                setFolderMenu(null)
+              }}
+            >
+              <Icon name="trash" size={12} /> 删除文件夹（需为空）
+            </button>
+          </div>
+        </>
+      )}
     </aside>
   )
 }

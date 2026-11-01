@@ -9,7 +9,16 @@ import ModelsDialog from './components/ModelsDialog'
 import DiffDialog from './components/DiffDialog'
 import { Icon } from './components/Icons'
 import { renderMarkdown, exportStyles, relativeTime } from './lib/markdown'
-import type { AppConfig, ClipItem, DocMeta, ModelProfile, SearchResult, Snippet, ViewKey } from './lib/types'
+import type {
+  AppConfig,
+  ClipItem,
+  DocMeta,
+  ModelProfile,
+  SearchResult,
+  Snippet,
+  ViewKey,
+  WriteProposal
+} from './lib/types'
 
 const FALLBACK: AppConfig = {
   vaultPath: '',
@@ -119,19 +128,22 @@ export default function App() {
   const [query, setQuery] = useState('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [outlineOpen, setOutlineOpen] = useState(false)
+  const [outlineId, setOutlineId] = useState<string | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [modelsOpen, setModelsOpen] = useState(false)
   const [aiOpen, setAiOpen] = useState(false)
-  const [toast, setToast] = useState<{ id: number; msg: string } | null>(null)
+  const [toast, setToast] = useState<{ id: number; msg: string; bad?: boolean } | null>(null)
   const [split, setSplit] = useState(0.5)
   const [dragging, setDragging] = useState(false)
   const [dropping, setDropping] = useState(false)
   const [entering, setEntering] = useState(true)
   const [maximized, setMaximized] = useState(false)
   const [selection, setSelection] = useState<{ text: string; x: number; y: number } | null>(null)
-  const [diff, setDiff] = useState<{ before: string; after: string; title: string } | null>(null)
+  const [diff, setDiff] = useState<{ before: string; after: string; title: string; writeId?: string } | null>(null)
   const [undo, setUndo] = useState<{ path: string; content: string; at: number } | null>(null)
+  /** AI 提交的修改提案，等待用户确认 */
+  const [writes, setWrites] = useState<WriteProposal[]>([])
 
   const editorRef = useRef<HTMLTextAreaElement | null>(null)
   const panesRef = useRef<HTMLDivElement | null>(null)
@@ -279,6 +291,7 @@ export default function App() {
     setActive(path)
     setView('notes')
     setSelection(null)
+    setOutlineId(null)
   }
 
   const closeTab = (path: string, e?: React.MouseEvent) => {
@@ -314,7 +327,7 @@ export default function App() {
       showToast(`已创建文件夹「${name}」`)
       return true
     } catch (err) {
-      showToast(String((err as Error)?.message || err).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''))
+      showToast(errText(err), true)
       return false
     }
   }
@@ -345,11 +358,90 @@ export default function App() {
     setDocs(list)
   }
 
+  const errText = (err: unknown) =>
+    String((err as Error)?.message || err).replace(/^Error invoking remote method '[^']+': (Error: )?/, '')
+
+  const dirOf = (path: string) => {
+    const cut = path.lastIndexOf('/')
+    return cut >= 0 ? path.slice(0, cut) : ''
+  }
+
+  /** 移动文档：标签、正文缓存、当前文档一起改路径，别让编辑器指向旧文件 */
+  const moveDoc = async (path: string, dir: string) => {
+    if (dirOf(path) === dir) {
+      showToast(dir ? '已经在这个文件夹里了' : '已经在根目录')
+      return
+    }
+    try {
+      if (pending.current[path] !== undefined) await flushSave(path)
+      const rel = await window.api.moveDoc(path, dir)
+      setTabs((t) => t.map((p) => (p === path ? rel : p)))
+      setContents((c) => {
+        if (c[path] === undefined) return c
+        const next = { ...c }
+        next[rel] = next[path]
+        delete next[path]
+        return next
+      })
+      if (pending.current[path] !== undefined) {
+        pending.current[rel] = pending.current[path]
+        delete pending.current[path]
+      }
+      setActive((a) => (a === path ? rel : a))
+      setDocs(await window.api.listDocs())
+      showToast(dir ? `已移动到「${dir.split('/').pop()}」` : '已移到根目录')
+    } catch (err) {
+      showToast(errText(err), true)
+    }
+  }
+
+  const renameFolder = async (rel: string, name: string) => {
+    try {
+      const next = await window.api.renameFolder(rel, name)
+      const remap = (p: string) => (p === rel || p.startsWith(`${rel}/`) ? next + p.slice(rel.length) : p)
+      setTabs((t) => t.map(remap))
+      setContents((c) => {
+        const out: Record<string, string> = {}
+        Object.entries(c).forEach(([k, v]) => {
+          out[remap(k)] = v
+        })
+        return out
+      })
+      Object.keys(pending.current).forEach((k) => {
+        const nk = remap(k)
+        if (nk !== k) {
+          pending.current[nk] = pending.current[k]
+          delete pending.current[k]
+        }
+      })
+      setActive((a) => (a ? remap(a) : a))
+      setFolders(await window.api.listFolders())
+      setDocs(await window.api.listDocs())
+      showToast(`文件夹已重命名为「${name}」`)
+    } catch (err) {
+      showToast(errText(err), true)
+    }
+  }
+
+  const deleteFolder = async (rel: string) => {
+    try {
+      await window.api.deleteFolder(rel)
+      setFolders(await window.api.listFolders())
+      showToast('文件夹已移到回收站')
+    } catch (err) {
+      showToast(errText(err), true)
+    }
+  }
+
+  const revealFolder = (rel: string) => {
+    window.api.revealFolder(rel).catch((err) => showToast(errText(err), true))
+  }
+
   // ---------------------------------------------------------------- 片段 / 剪贴板
-  const showToast = useCallback((msg: string) => {
-    setToast({ id: Date.now(), msg })
+  const showToast = useCallback((msg: string, bad = false) => {
+    setToast({ id: Date.now(), msg, bad })
     if (toastTimer.current) clearTimeout(toastTimer.current)
-    toastTimer.current = setTimeout(() => setToast(null), 1700)
+    toastTimer.current = setTimeout(() => setToast(null), bad ? 2600 : 1700)
   }, [])
 
   const copy = useCallback(
@@ -359,6 +451,22 @@ export default function App() {
     },
     [showToast]
   )
+
+  // ---------------------------------------------------------------- AI 写提案
+  useEffect(() => {
+    const offs = [
+      window.api.aiOnWrite((p) => {
+        setWrites((ws) => [...ws.filter((w) => w.path !== p.path), p])
+        showToast('AI 提交了一处修改，等你确认')
+      }),
+      window.api.aiOnWriteDrop((d) => setWrites((ws) => ws.filter((w) => w.id !== d.id))),
+      window.api.aiOnDocCreated(async (d) => {
+        setDocs(await window.api.listDocs())
+        showToast(`AI 新建了「${d.title}」`)
+      })
+    ]
+    return () => offs.forEach((off) => off())
+  }, [showToast])
 
   const addSnippet = (content: string) => {
     const firstLine = content.split('\n').find((l) => l.trim()) || '未命名片段'
@@ -410,6 +518,44 @@ export default function App() {
   const mode = config.editorMode
   const currentMeta = docs.find((d) => d.path === active)
   const title = currentMeta?.title || active?.replace(/\.md$/i, '') || 'Inkwell'
+
+  /** 大纲跳转：预览里滚到标题，编辑区里把光标挪到标题行（两边都动，分栏时保持一致） */
+  const jumpToHeading = (h: { id: string; line: number; text: string }) => {
+    setOutlineId(h.id)
+
+    if (mode !== 'edit') {
+      const scroller = document.querySelector('.preview') as HTMLElement | null
+      const el = scroller?.querySelector(`[id="${h.id}"]`) as HTMLElement | null
+      if (scroller && el) {
+        const top = el.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop - 18
+        scroller.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+        el.classList.remove('is-jump')
+        void el.offsetWidth
+        el.classList.add('is-jump')
+        window.setTimeout(() => el.classList.remove('is-jump'), 1100)
+      }
+    }
+
+    if (mode !== 'preview' && active) {
+      const ta = editorRef.current
+      const text = contents[active] ?? ''
+      if (ta && text) {
+        const lines = text.split('\n')
+        const line = Math.min(Math.max(0, h.line), lines.length - 1)
+        let idx = 0
+        for (let i = 0; i < line; i++) idx += lines[i].length + 1
+        const end = idx + (lines[line]?.length || 0)
+        ta.focus()
+        ta.setSelectionRange(idx, end)
+        // setSelectionRange 不保证把光标滚进视野，按行高自己算
+        const cs = getComputedStyle(ta)
+        const lh = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.8
+        const padTop = parseFloat(cs.paddingTop) || 0
+        ta.scrollTop = Math.max(0, padTop + line * lh - ta.clientHeight / 3)
+        caretRef.current = { path: active, start: idx, end }
+      }
+    }
+  }
 
   // ---------------------------------------------------------------- AI 动作
   const revealAi = (open: boolean) => {
@@ -464,8 +610,58 @@ export default function App() {
     setDiff({ before: contents[active] ?? '', after, title })
   }
 
+  /** 看一眼 AI 提案的 diff（真正落盘仍在 applyWrite 里） */
+  const previewWrite = (id: string) => {
+    const w = writes.find((x) => x.id === id)
+    if (!w) return
+    setDiff({ before: w.before, after: w.after, title: w.title, writeId: id })
+  }
+
+  const discardWrite = async (id: string) => {
+    await window.api.aiDiscardWrite(id)
+    setWrites((ws) => ws.filter((w) => w.id !== id))
+    showToast('已忽略这条修改')
+  }
+
+  const applyWrite = async (id: string) => {
+    const w = writes.find((x) => x.id === id)
+    if (!w) return
+    // 编辑器里可能有没落盘的改动：先 flush，再比对，避免覆盖用户正在写的内容
+    if (pending.current[w.path] !== undefined) await flushSave(w.path)
+    const inMemory = contents[w.path]
+    if (inMemory !== undefined && inMemory !== w.before) {
+      await window.api.aiDiscardWrite(id)
+      setWrites((ws) => ws.filter((x) => x.id !== id))
+      showToast('文档在这期间被改过，这条提案作废了')
+      return
+    }
+    const res = await window.api.aiApplyWrite(id)
+    if (!res.ok || !res.path || typeof res.content !== 'string') {
+      await window.api.aiDiscardWrite(id)
+      setWrites((ws) => ws.filter((x) => x.id !== id))
+      showToast(res.message || '应用失败')
+      return
+    }
+    const path = res.path
+    setContents((c) => ({ ...c, [path]: res.content as string }))
+    setDirty((d) => ({ ...d, [path]: false }))
+    delete pending.current[path]
+    setUndo({ path, content: res.before ?? w.before, at: Date.now() })
+    setDocs(await window.api.listDocs())
+    setWrites((ws) => ws.filter((x) => x.id !== id))
+    openDoc(path)
+    showToast('AI 修改已应用 · Ctrl+Z 撤回')
+  }
+
   const applyDiff = () => {
-    if (!diff || !active) return
+    if (!diff) return
+    if (diff.writeId) {
+      const id = diff.writeId
+      setDiff(null)
+      void applyWrite(id)
+      return
+    }
+    if (!active) return
     setUndo({ path: active, content: diff.before, at: Date.now() })
     handleChange(diff.after)
     setDiff(null)
@@ -883,6 +1079,10 @@ export default function App() {
             onNew={createDoc}
             folders={folders}
             onNewFolder={createFolder}
+            onMove={moveDoc}
+            onRevealFolder={revealFolder}
+            onRenameFolder={renameFolder}
+            onDeleteFolder={deleteFolder}
             onDelete={deleteDoc}
             onRename={renameDoc}
             onReveal={(p) => window.api.revealDoc(p)}
@@ -966,6 +1166,15 @@ export default function App() {
                   </span>
                 </div>
                 <div className="docbar-meta">
+                  <button
+                    className="docbar-path"
+                    onClick={() => revealFolder(dirOf(active))}
+                    title={`当前文件所在目录：${dirOf(active) || '笔记库根目录'}（点击在资源管理器中打开）`}
+                  >
+                    <Icon name="folder" size={11} />
+                    {dirOf(active) ? dirOf(active).split('/').join(' / ') : '根目录'}
+                  </button>
+                  <span className="dot-sep" />
                   {rendered?.words ?? 0} 字
                   <span className="dot-sep" />
                   {relativeTime(currentMeta?.mtime || Date.now())}
@@ -1066,9 +1275,10 @@ export default function App() {
               {rendered.headings.map((h) => (
                 <button
                   key={h.id}
-                  className="outline-item"
+                  className={`outline-item${outlineId === h.id ? ' is-active' : ''}`}
                   style={{ paddingLeft: 10 + (h.level - 1) * 12 }}
-                  onClick={() => document.getElementById(h.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                  onClick={() => jumpToHeading(h)}
+                  title={h.text}
                 >
                   <span className={`outline-dot lv${h.level}`} />
                   {h.text || '（空标题）'}
@@ -1095,6 +1305,10 @@ export default function App() {
           onManageModels={() => setModelsOpen(true)}
           onInsert={appendText}
           onInsertAtCursor={insertAtCaret}
+          writes={writes}
+          onApplyWrite={applyWrite}
+          onDiscardWrite={discardWrite}
+          onPreviewWrite={previewWrite}
           onReplaceDoc={requestReplace}
           onNewDoc={createFromAi}
           onCopy={copy}
@@ -1201,8 +1415,8 @@ export default function App() {
       />
 
       {toast && (
-        <div className="toast" key={toast.id}>
-          <Icon name="check" size={13} />
+        <div className={`toast${toast.bad ? ' is-bad' : ''}`} key={toast.id}>
+          <Icon name={toast.bad ? 'alert' : 'check'} size={13} />
           {toast.msg}
         </div>
       )}

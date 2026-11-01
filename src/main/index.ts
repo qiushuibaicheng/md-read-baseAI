@@ -627,6 +627,40 @@ function setupIPC() {
     shell.showItemInFolder(safePath(rel))
   })
 
+  // 打开某个文件夹本身（空字符串 = 笔记库根目录）
+  ipcMain.handle('folder:reveal', async (_e, rel: string) => {
+    const abs = rel ? safePath(rel) : config.vaultPath
+    if (!existsSync(abs)) throw new Error('文件夹不存在')
+    const err = await shell.openPath(abs)
+    if (err) throw new Error(err)
+  })
+
+  // 侧栏右键：新建/重命名/删除文件夹
+  ipcMain.handle('folder:rename', async (_e, rel: string, nextName: string) => {
+    const abs = safePath(rel)
+    const clean = (nextName || '').replace(/[\\/:*?"<>|]/g, '').trim()
+    if (!clean) throw new Error('文件夹名不能为空')
+    const dest = join(dirname(abs), clean)
+    if (existsSync(dest)) throw new Error(`「${clean}」已存在`)
+    await fsp.rename(abs, dest)
+    const next = relative(config.vaultPath, dest).split('\\').join('/')
+    // 同步改写已打开标签里位于该文件夹的路径
+    const old = rel.replace(/\/+$/, '')
+    const remap = (p: string) => (p === old || p.startsWith(`${old}/`) ? next + p.slice(old.length) : p)
+    config.openTabs = (config.openTabs || []).map(remap)
+    if (config.lastDoc) config.lastDoc = remap(config.lastDoc)
+    saveConfig()
+    return next
+  })
+
+  ipcMain.handle('folder:delete', async (_e, rel: string) => {
+    const abs = safePath(rel)
+    const inside = await fsp.readdir(abs).catch(() => ['x'])
+    if (inside.length > 0) throw new Error('文件夹不是空的，先把文档移出去')
+    await shell.trashItem(abs)
+    return true
+  })
+
   ipcMain.handle('doc:openExternal', async (_e, rel: string) => {
     await shell.openPath(safePath(rel))
   })
@@ -779,7 +813,22 @@ if (!gotLock) {
     registerAi(USER_DIR, () => win, () => ({
       list: async () => (await scanVault()).map((d) => ({ path: d.path, title: d.title, size: d.size })),
       read: (rel: string) => fsp.readFile(safePath(rel), 'utf-8'),
-      search: (q: string) => searchVault(q)
+      search: (q: string) => searchVault(q),
+      // 仅用于用户已确认的 AI 提案
+      write: async (rel: string, content: string) => {
+        const abs = safePath(rel)
+        await fsp.mkdir(dirname(abs), { recursive: true })
+        await fsp.writeFile(abs, content, 'utf-8')
+      },
+      create: async (title: string, content: string, dir?: string) => {
+        const dirAbs = dir ? safePath(dir) : config.vaultPath
+        ensureDir(dirAbs)
+        const clean = title.replace(/[\\/:*?"<>|]/g, '').trim() || '未命名'
+        const name = uniqueName(dirAbs, clean)
+        const abs = join(dirAbs, name)
+        await fsp.writeFile(abs, content.endsWith('\n') ? content : `${content}\n`, 'utf-8')
+        return relative(config.vaultPath, abs).split('\\').join('/')
+      }
     }))
     createWindow()
     createTray()

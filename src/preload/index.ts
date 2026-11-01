@@ -13,6 +13,9 @@ const api = {
   listDocs: () => ipcRenderer.invoke('vault:list'),
   listFolders: () => ipcRenderer.invoke('vault:folders'),
   makeFolder: (payload: { parent?: string; name: string }) => ipcRenderer.invoke('vault:mkdir', payload),
+  revealFolder: (rel: string) => ipcRenderer.invoke('folder:reveal', rel),
+  renameFolder: (rel: string, name: string) => ipcRenderer.invoke('folder:rename', rel, name),
+  deleteFolder: (rel: string) => ipcRenderer.invoke('folder:delete', rel),
   moveDoc: (rel: string, targetDir: string) => ipcRenderer.invoke('doc:move', rel, targetDir),
   pickVault: () => ipcRenderer.invoke('vault:pick'),
   vaultPath: () => ipcRenderer.invoke('vault:path'),
@@ -47,6 +50,8 @@ const api = {
   aiTitle: (payload: unknown) => ipcRenderer.invoke('ai:title', payload),
   aiSessions: () => ipcRenderer.invoke('ai:sessions'),
   aiSaveSessions: (list: unknown) => ipcRenderer.invoke('ai:sessions:save', list),
+  aiApplyWrite: (id: string) => ipcRenderer.invoke('ai:write:apply', id),
+  aiDiscardWrite: (id: string) => ipcRenderer.invoke('ai:write:discard', id),
 
   hide: () => ipcRenderer.invoke('window:hide'),
   pin: (on: boolean) => ipcRenderer.invoke('window:pin', on),
@@ -78,7 +83,22 @@ const api = {
       status: 'running' | 'done' | 'unsupported'
       preview?: string
     }) => void
-  ) => on('ai:tool', cb)
+  ) => on('ai:tool', cb),
+  aiOnWrite: (
+    cb: (d: {
+      id: string
+      reqId: string
+      path: string
+      title: string
+      before: string
+      after: string
+      add: number
+      del: number
+      createdAt: number
+    }) => void
+  ) => on('ai:write', cb),
+  aiOnWriteDrop: (cb: (d: { id: string }) => void) => on('ai:write:drop', cb),
+  aiOnDocCreated: (cb: (d: { path: string; title: string }) => void) => on('ai:doc-created', cb)
 }
 
 contextBridge.exposeInMainWorld('api', api)

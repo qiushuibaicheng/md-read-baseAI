@@ -8,11 +8,14 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 export interface ModelProfile {
   id: string
   name: string
+  provider?: string
   baseUrl: string
   apiKey: string
   model: string
   temperature: number
   maxTokens: number
+  /** 上下文窗口，仅用于界面提示上下文预算上限 */
+  maxContext?: number
   /** 额外的请求头，JSON 字符串，例如 {"X-Org":"team"} */
   extraHeaders?: string
   createdAt: number
@@ -184,6 +187,10 @@ export interface VaultAccess {
   list(): Promise<{ path: string; title: string; size: number }[]>
   read(path: string): Promise<string>
   search(query: string): Promise<{ path: string; title: string; hits: { line: number; text: string }[] }[]>
+  /** 覆盖写入（仅用于用户已确认的提案） */
+  write(path: string, content: string): Promise<void>
+  /** 新建文档，返回相对路径 */
+  create(title: string, content: string, dir?: string): Promise<string>
 }
 
 interface ToolCall {
@@ -236,19 +243,95 @@ const VAULT_TOOLS = [
         required: ['query']
       }
     }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'create_doc',
+      description:
+        '新建一篇文档并写入内容（这一步会真的创建文件）。适合把结论、排查记录、方案整理成新笔记。正文请自带 Markdown 标题。',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: '文件名（不含 .md），6-24 字，能看出主题' },
+          content: { type: 'string', description: '完整的 Markdown 正文' },
+          dir: { type: 'string', description: '可选，放到笔记库里的哪个子目录（相对路径）' }
+        },
+        required: ['title', 'content']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'edit_doc',
+      description:
+        '修改已有文档。不会直接落盘：会生成一条待确认的修改提案，由用户看过 diff 后决定是否应用。优先用小范围替换，不要整篇重写。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '要修改的文档相对路径，必须来自清单或 list_docs 返回' },
+          edits: {
+            type: 'array',
+            description:
+              '替换列表。每处的 old 必须是从原文原样复制的唯一片段（含缩进和标点）；找不到或有多个匹配会被拒绝，需要重新读文档。',
+            items: {
+              type: 'object',
+              properties: {
+                old: { type: 'string', description: '要被替换的原文，需唯一匹配' },
+                new: { type: 'string', description: '替换成什么，留空表示删除' }
+              },
+              required: ['old', 'new']
+            }
+          },
+          append: { type: 'string', description: '可选，追加到文档末尾的 Markdown 片段' }
+        },
+        required: ['path']
+      }
+    }
   }
 ]
 
 const MAX_TOOL_ROUNDS = 4
 const TOOL_OUTPUT_LIMIT = 14000
 
-async function execTool(vault: VaultAccess, name: string, rawArgs: string): Promise<string> {
-  let args: Record<string, unknown> = {}
+/** 待用户确认的写提案：AI 只能提议，落盘要用户点头 */
+export interface WriteProposal {
+  id: string
+  reqId: string
+  path: string
+  title: string
+  before: string
+  after: string
+  add: number
+  del: number
+  createdAt: number
+}
+
+const pendingWrites = new Map<string, WriteProposal>()
+
+const lineCount = (s: string) => (s ? s.split('\n').length : 0)
+const titleOf = (p: string) => (p.split('/').pop() || p).replace(/\.md$/i, '')
+const normPath = (v: unknown) => String(v ?? '').trim().replace(/^\.?\//, '')
+
+interface ToolCtx {
+  send: (channel: string, payload: unknown) => void
+  reqId: string
+  vault: VaultAccess
+}
+
+/**
+ * 执行一次工具调用。读类工具直接返回内容；
+ * 写类工具里，新建文档立即生效，修改已有文档只登记提案（等用户确认）。
+ */
+async function execTool(name: string, rawArgs: string, ctx: ToolCtx): Promise<string> {
+  let args: Record<string, any> = {}
   try {
     args = rawArgs?.trim() ? JSON.parse(rawArgs) : {}
   } catch {
     return '工具参数不是合法 JSON，请重新调用并只传 JSON 对象'
   }
+  const { vault, send, reqId } = ctx
   try {
     if (name === 'list_docs') {
       const all = await vault.list()
@@ -280,9 +363,80 @@ async function execTool(vault: VaultAccess, name: string, rawArgs: string): Prom
         .map((h) => `${h.path}\n${h.hits.map((x) => `  第${x.line}行: ${x.text}`).join('\n')}`)
         .join('\n\n')
     }
+    if (name === 'create_doc') {
+      const title = String(args.title || '').trim().slice(0, 60)
+      const content = String(args.content ?? '').replace(/\r\n/g, '\n').trim()
+      if (!title) return '缺少 title 参数'
+      if (!content) return 'content 为空，新建文档至少要给正文'
+      if (content.length > 40000) return '内容超过 4 万字符，请拆分后再建'
+      const dir = typeof args.dir === 'string' ? args.dir.trim().replace(/^\.?\//, '') : undefined
+      const rel = await vault.create(title, content, dir)
+      send('ai:doc-created', { path: rel, title: titleOf(rel) })
+      return `已新建文档：${rel}（${content.length} 字符）。用户在侧栏能看到它；需要再改可以直接用 edit_doc。`
+    }
+    if (name === 'edit_doc') {
+      const p = normPath(args.path)
+      if (!p) return '缺少 path 参数'
+      if (!/\.md$/i.test(p)) return 'path 必须是 .md 文档'
+      const before = await vault.read(p)
+      const edits: any[] = Array.isArray(args.edits) ? args.edits.slice(0, 20) : []
+      const append = typeof args.append === 'string' ? args.append.replace(/\r\n/g, '\n').trim() : ''
+      if (!edits.length && !append) return '没有传 edits 或 append，什么都没改'
+
+      let text = before
+      let add = 0
+      let del = 0
+      for (let i = 0; i < edits.length; i++) {
+        const oldText = String(edits[i]?.old ?? '')
+        const newText = String(edits[i]?.new ?? '')
+        if (!oldText) return `第 ${i + 1} 处修改缺少 old（要替换的原文），请重新调用`
+        if (oldText === newText) continue
+        if (oldText.length > 20000) return `第 ${i + 1} 处 old 太长，请拆成更小的片段`
+        const first = text.indexOf(oldText)
+        if (first < 0) {
+          return `第 ${i + 1} 处的原文没有在文档里找到。请先 read_doc 拿到准确原文再改，空格、标点、缩进都要和原文完全一致。`
+        }
+        if (text.indexOf(oldText, first + 1) >= 0) {
+          return `第 ${i + 1} 处的原文在文档里出现了多次，请多带一两行上下文，让它唯一。`
+        }
+        text = text.slice(0, first) + newText + text.slice(first + oldText.length)
+        add += lineCount(newText)
+        del += lineCount(oldText)
+      }
+      if (append) {
+        const sep = !text ? '' : text.endsWith('\n\n') ? '' : text.endsWith('\n') ? '\n' : '\n\n'
+        text = `${text}${sep}${append}`
+        add += lineCount(append) + 1
+      }
+      if (text === before) return '和原文完全一致，没有产生修改。'
+
+      // 同一篇文档只保留最新一条提案，旧的作废
+      for (const [id, w] of pendingWrites) {
+        if (w.path === p) {
+          pendingWrites.delete(id)
+          send('ai:write:drop', { id })
+        }
+      }
+      // 卡片上尽量显示文档标题（首个 H1），没有就用文件名
+      const h1 = before.match(/^#\s+(.+?)\s*$/m)?.[1]
+      const proposal: WriteProposal = {
+        id: `w-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+        reqId,
+        path: p,
+        title: h1 && h1.length <= 30 ? h1 : titleOf(p),
+        before,
+        after: text,
+        add: Math.max(add, 1),
+        del,
+        createdAt: Date.now()
+      }
+      pendingWrites.set(proposal.id, proposal)
+      send('ai:write', proposal)
+      return `已提交修改提案（尚未写入磁盘，等用户在面板里确认）：${p}，+${proposal.add} −${proposal.del} 行。请用一到两句话说明改了什么，并提醒用户点「应用」生效。`
+    }
     return `未知工具：${name}`
   } catch (err) {
-    return `读取失败：${(err as Error)?.message || '未知错误'}`
+    return `操作失败：${(err as Error)?.message || '未知错误'}`
   }
 }
 
@@ -494,7 +648,7 @@ async function runChat(
     if (!wantsTools || !vault) {
       if (!acc.trim() && !accReason.trim()) {
         acc = r.toolCalls.length
-          ? '模型反复请求读取文档但没有给出结论。可以换个问法，或减少上下文文档后重试。'
+          ? '模型连续调用工具但没有给出结论。可以换个问法，或减少上下文文档后重试。'
           : ''
         if (!acc) throw new Error('模型没有返回内容')
       }
@@ -515,7 +669,11 @@ async function runChat(
         args: call.function.arguments,
         status: 'running'
       })
-      const out = await execTool(vault, call.function.name, call.function.arguments)
+      const out = await execTool(call.function.name, call.function.arguments, {
+        vault,
+        send,
+        reqId: payload.reqId
+      })
       messages.push({ role: 'tool', tool_call_id: call.id, content: out })
       send('ai:tool', {
         reqId: payload.reqId,
@@ -604,6 +762,7 @@ export function registerAi(
       model: profile.model?.trim() || '',
       temperature: Number.isFinite(profile.temperature) ? profile.temperature : 0.3,
       maxTokens: Number.isFinite(profile.maxTokens) ? profile.maxTokens : 4000,
+      maxContext: Number.isFinite(profile.maxContext) ? profile.maxContext : 128000,
       createdAt: profile.createdAt || Date.now()
     }
     const idx = models.findIndex((m) => m.id === clean.id)
@@ -676,6 +835,28 @@ export function registerAi(
     } catch {
       return null
     }
+  })
+
+  ipcMain.handle('ai:write:apply', async (_e, id: string) => {
+    const w = pendingWrites.get(id)
+    if (!w) return { ok: false, message: '这条提案已经失效' }
+    const vault = getVault ? getVault() : null
+    if (!vault) return { ok: false, message: '没有可写的笔记库' }
+    try {
+      const current = await vault.read(w.path).catch(() => null)
+      if (current === null) return { ok: false, message: '文档已经不在了，提案作废' }
+      if (current !== w.before) return { ok: false, message: '文档在这期间被改过，提案已过期，让 AI 重新生成一次' }
+      await vault.write(w.path, w.after)
+      pendingWrites.delete(id)
+      return { ok: true, path: w.path, content: w.after, before: w.before }
+    } catch (err) {
+      return { ok: false, message: describeError(err) }
+    }
+  })
+
+  ipcMain.handle('ai:write:discard', (_e, id: string) => {
+    pendingWrites.delete(id)
+    return true
   })
 
   ipcMain.handle('ai:sessions', () => sessions)

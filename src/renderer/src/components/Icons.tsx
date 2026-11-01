@@ -123,6 +123,14 @@ const P: Record<string, ReactNode> = {
       <path d="M3.5 6.5A2 2 0 0 1 5.5 4.5h4l2 2.5h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2z" />
     </>
   ),
+  move: (
+    <>
+      <path d="M12 3.5v17" />
+      <path d="M8 7.5 12 3.5l4 4M8 16.5l4 4 4-4" />
+      <path d="M3.5 12h17" />
+      <path d="M7.5 8 3.5 12l4 4M16.5 8l4 4-4 4" />
+    </>
+  ),
   enter: <path d="M20 5v7.5a3 3 0 0 1-3 3H5M9 11l-4 4 4 4" />,
   more: (
     <>

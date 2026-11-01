@@ -24,11 +24,13 @@ export interface AppConfig {
 export interface ModelProfile {
   id: string
   name: string
+  provider?: string
   baseUrl: string
   apiKey: string
   model: string
   temperature: number
   maxTokens: number
+  maxContext?: number
   extraHeaders?: string
   createdAt: number
 }
@@ -64,6 +66,18 @@ export interface AiChatRequest {
   temperature?: number
   maxTokens?: number
   tools?: boolean
+}
+
+export interface WriteProposal {
+  id: string
+  reqId: string
+  path: string
+  title: string
+  before: string
+  after: string
+  add: number
+  del: number
+  createdAt: number
 }
 
 export interface DocMeta {
@@ -111,6 +125,9 @@ export interface InkAPI {
   listDocs(): Promise<DocMeta[]>
   listFolders(): Promise<string[]>
   makeFolder(payload: { parent?: string; name: string }): Promise<string>
+  revealFolder(rel: string): Promise<void>
+  renameFolder(rel: string, name: string): Promise<string>
+  deleteFolder(rel: string): Promise<boolean>
   moveDoc(rel: string, targetDir: string): Promise<string>
   pickVault(): Promise<{ config: AppConfig; docs: DocMeta[] } | null>
   vaultPath(): Promise<string>
@@ -141,6 +158,8 @@ export interface InkAPI {
   aiTitle(payload: { profileId: string; content: string }): Promise<string | null>
   aiSessions(): Promise<AiSession[]>
   aiSaveSessions(list: AiSession[]): Promise<boolean>
+  aiApplyWrite(id: string): Promise<{ ok: boolean; message?: string; path?: string; content?: string; before?: string }>
+  aiDiscardWrite(id: string): Promise<boolean>
   hide(): Promise<void>
   pin(on: boolean): Promise<boolean>
   toggleMaximize(): Promise<boolean>
@@ -169,6 +188,9 @@ export interface InkAPI {
       preview?: string
     }) => void
   ): () => void
+  aiOnWrite(cb: (d: WriteProposal) => void): () => void
+  aiOnWriteDrop(cb: (d: { id: string }) => void): () => void
+  aiOnDocCreated(cb: (d: { path: string; title: string }) => void): () => void
 }
 
 declare global {

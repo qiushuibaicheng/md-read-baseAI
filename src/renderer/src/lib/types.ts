@@ -24,11 +24,15 @@ export interface AppConfig {
 export interface ModelProfile {
   id: string
   name: string
+  /** 服务商标识（openai-compat / deepseek / glm / moonshot / qwen / ollama），只用于界面提示 */
+  provider?: string
   baseUrl: string
   apiKey: string
   model: string
   temperature: number
   maxTokens: number
+  /** 模型上下文窗口，决定 AI 面板里上下文预算的上限 */
+  maxContext?: number
   extraHeaders?: string
   createdAt: number
 }
@@ -57,6 +61,20 @@ export interface AiSession {
   messages: AiSessionMessage[]
   createdAt: number
   updatedAt: number
+}
+
+/** AI 提交的文档修改提案：确认后才落盘 */
+export interface WriteProposal {
+  id: string
+  reqId: string
+  path: string
+  title: string
+  before: string
+  after: string
+  /** 增 / 删行数，仅用于显示 */
+  add: number
+  del: number
+  createdAt: number
 }
 
 export interface DocMeta {
