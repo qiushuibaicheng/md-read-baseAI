@@ -20,9 +20,11 @@ import type {
   WriteProposal
 } from './lib/types'
 
+const DEFAULT_HOTKEY = 'Alt+M'
+
 const FALLBACK: AppConfig = {
   vaultPath: '',
-  hotkey: 'Alt+Space',
+  hotkey: DEFAULT_HOTKEY,
   hideOnBlur: true,
   alwaysOnTop: false,
   threeBg: true,
@@ -40,7 +42,8 @@ const FALLBACK: AppConfig = {
   aiAutoTitle: false,
   aiPanelWidth: 396,
   accent: 'indigo',
-  themeMode: 'dark'
+  themeMode: 'dark',
+  order: {}
 }
 
 function mergeDocs(prev: DocMeta[], next: DocMeta[]): DocMeta[] {
@@ -186,8 +189,8 @@ export default function App() {
         setModels(list)
         if (!res.config.aiModelId && list[0]) window.api.setConfig({ aiModelId: list[0].id })
       })
-      if (res.hotkeyActive && res.hotkeyActive !== 'Alt+Space') {
-        setTimeout(() => showToast(`Alt+Space 被占用，已改用 ${res.hotkeyActive} 召出`), 1200)
+      if (res.hotkeyActive && res.hotkeyActive !== DEFAULT_HOTKEY) {
+        setTimeout(() => showToast(`${DEFAULT_HOTKEY} 被占用，已改用 ${res.hotkeyActive} 召出`), 1200)
       }
     })
 
@@ -345,17 +348,8 @@ export default function App() {
 
   const renameDoc = async (path: string, name: string) => {
     const rel = await window.api.renameDoc(path, name)
-    setTabs((t) => t.map((p) => (p === path ? rel : p)))
-    setContents((c) => {
-      if (c[path] === undefined) return c
-      const next = { ...c }
-      next[rel] = next[path]
-      delete next[path]
-      return next
-    })
-    if (active === path) setActive(rel)
-    const list = await window.api.listDocs()
-    setDocs(list)
+    remapPaths(path, rel)
+    setDocs(await window.api.listDocs())
   }
 
   const errText = (err: unknown) =>
@@ -364,6 +358,59 @@ export default function App() {
   const dirOf = (path: string) => {
     const cut = path.lastIndexOf('/')
     return cut >= 0 ? path.slice(0, cut) : ''
+  }
+
+  /**
+   * 移动 / 改名之后，所有指向旧路径的状态一起搬过去：
+   * 标签、正文缓存、脏标记、待存内容、当前文档、插入点、AI 提案、撤回快照。
+   * 文件夹移动时 from 是前缀，子路径一并改写。
+   */
+  const remapPaths = (from: string, to: string) => {
+    const map = (p: string) => (p === from || p.startsWith(`${from}/`) ? to + p.slice(from.length) : p)
+    setTabs((t) => t.map(map))
+    setContents((c) => {
+      const out: Record<string, string> = {}
+      Object.entries(c).forEach(([k, v]) => {
+        out[map(k)] = v
+      })
+      return out
+    })
+    setDirty((d) => {
+      const out: Record<string, boolean> = {}
+      Object.entries(d).forEach(([k, v]) => {
+        out[map(k)] = v
+      })
+      return out
+    })
+    Object.keys(pending.current).forEach((k) => {
+      const nk = map(k)
+      if (nk !== k) {
+        pending.current[nk] = pending.current[k]
+        delete pending.current[k]
+      }
+    })
+    setActive((a) => (a ? map(a) : a))
+    if (caretRef.current) caretRef.current.path = map(caretRef.current.path)
+    setWrites((list) => list.map((w) => (map(w.path) === w.path ? w : { ...w, path: map(w.path) })))
+    setUndo((u) => (u && map(u.path) !== u.path ? { ...u, path: map(u.path) } : u))
+  }
+
+  /** 拖拽落位：跨目录移动 + 手动排序，一次请求搞定，避免拖完顺序又被打回字母序 */
+  const arrangeEntry = async (payload: { kind: 'doc' | 'dir'; path: string; targetDir: string; index: number }) => {
+    try {
+      if (payload.kind === 'doc' && pending.current[payload.path] !== undefined) await flushSave(payload.path)
+      const res = await window.api.arrange(payload)
+      if (res.rel !== payload.path) {
+        remapPaths(payload.path, res.rel)
+        const label = payload.targetDir ? `「${payload.targetDir.split('/').pop()}」` : '根目录'
+        showToast(payload.kind === 'dir' ? `文件夹已移到${label}` : `已移到${label}`)
+      }
+      setConfig((c) => ({ ...c, order: res.order || {} }))
+      setDocs(res.docs)
+      setFolders(res.folders)
+    } catch (err) {
+      showToast(errText(err), true)
+    }
   }
 
   /** 移动文档：标签、正文缓存、当前文档一起改路径，别让编辑器指向旧文件 */
@@ -375,19 +422,7 @@ export default function App() {
     try {
       if (pending.current[path] !== undefined) await flushSave(path)
       const rel = await window.api.moveDoc(path, dir)
-      setTabs((t) => t.map((p) => (p === path ? rel : p)))
-      setContents((c) => {
-        if (c[path] === undefined) return c
-        const next = { ...c }
-        next[rel] = next[path]
-        delete next[path]
-        return next
-      })
-      if (pending.current[path] !== undefined) {
-        pending.current[rel] = pending.current[path]
-        delete pending.current[path]
-      }
-      setActive((a) => (a === path ? rel : a))
+      remapPaths(path, rel)
       setDocs(await window.api.listDocs())
       showToast(dir ? `已移动到「${dir.split('/').pop()}」` : '已移到根目录')
     } catch (err) {
@@ -398,23 +433,7 @@ export default function App() {
   const renameFolder = async (rel: string, name: string) => {
     try {
       const next = await window.api.renameFolder(rel, name)
-      const remap = (p: string) => (p === rel || p.startsWith(`${rel}/`) ? next + p.slice(rel.length) : p)
-      setTabs((t) => t.map(remap))
-      setContents((c) => {
-        const out: Record<string, string> = {}
-        Object.entries(c).forEach(([k, v]) => {
-          out[remap(k)] = v
-        })
-        return out
-      })
-      Object.keys(pending.current).forEach((k) => {
-        const nk = remap(k)
-        if (nk !== k) {
-          pending.current[nk] = pending.current[k]
-          delete pending.current[k]
-        }
-      })
-      setActive((a) => (a ? remap(a) : a))
+      remapPaths(rel, next)
       setFolders(await window.api.listFolders())
       setDocs(await window.api.listDocs())
       showToast(`文件夹已重命名为「${name}」`)
@@ -1078,6 +1097,8 @@ export default function App() {
             onOpen={openDoc}
             onNew={createDoc}
             folders={folders}
+            order={config.order || {}}
+            onArrange={arrangeEntry}
             onNewFolder={createFolder}
             onMove={moveDoc}
             onRevealFolder={revealFolder}

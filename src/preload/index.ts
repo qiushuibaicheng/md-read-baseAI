@@ -17,6 +17,8 @@ const api = {
   renameFolder: (rel: string, name: string) => ipcRenderer.invoke('folder:rename', rel, name),
   deleteFolder: (rel: string) => ipcRenderer.invoke('folder:delete', rel),
   moveDoc: (rel: string, targetDir: string) => ipcRenderer.invoke('doc:move', rel, targetDir),
+  arrange: (payload: { kind: 'doc' | 'dir'; path: string; targetDir?: string; index?: number }) =>
+    ipcRenderer.invoke('vault:arrange', payload),
   pickVault: () => ipcRenderer.invoke('vault:pick'),
   vaultPath: () => ipcRenderer.invoke('vault:path'),
   readDoc: (rel: string) => ipcRenderer.invoke('doc:read', rel),

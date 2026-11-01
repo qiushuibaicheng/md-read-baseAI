@@ -19,6 +19,8 @@ export interface AppConfig {
   aiPanelWidth: number
   accent: string
   themeMode: 'dark' | 'light' | 'system'
+  /** 侧栏手动排序：目录相对路径 → 条目相对路径顺序 */
+  order: Record<string, string[]>
 }
 
 export interface ModelProfile {

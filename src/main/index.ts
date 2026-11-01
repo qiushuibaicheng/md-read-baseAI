@@ -16,6 +16,7 @@ import {
 } from 'electron'
 import { join, resolve, relative, extname, basename, dirname } from 'path'
 import { readFileSync, writeFileSync, mkdirSync, existsSync, watch, FSWatcher } from 'fs'
+import type { Dirent } from 'fs'
 import * as fsp from 'fs/promises'
 import { pathToFileURL } from 'url'
 import { registerAi } from './ai'
@@ -30,7 +31,7 @@ const CONFIG_FILE = join(USER_DIR, 'config.json')
 const SNIPPET_FILE = join(USER_DIR, 'snippets.json')
 const CLIP_FILE = join(USER_DIR, 'clipboard.json')
 
-const DEFAULT_HOTKEY = 'Alt+Space'
+const DEFAULT_HOTKEY = 'Alt+M'
 
 interface Config {
   vaultPath: string
@@ -53,6 +54,10 @@ interface Config {
   aiPanelWidth: number
   accent: string
   themeMode: 'dark' | 'light' | 'system'
+  /** 侧栏手动排序：目录相对路径 → 该目录下条目的相对路径顺序（文件夹与文档混排） */
+  order: Record<string, string[]>
+  /** 默认热键迁移标记，只跑一次，避免用户手动设回旧值后被反复改写 */
+  hotkeyMigrated?: boolean
 }
 
 const defaultConfig = (): Config => ({
@@ -75,7 +80,8 @@ const defaultConfig = (): Config => ({
   aiAutoTitle: false,
   aiPanelWidth: 396,
   accent: 'indigo',
-  themeMode: nativeTheme.shouldUseDarkColors ? 'dark' : 'light'
+  themeMode: nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
+  order: {}
 })
 
 function ensureDir(p: string) {
@@ -96,11 +102,22 @@ function writeJSON(file: string, data: unknown) {
 }
 
 let config: Config = { ...defaultConfig(), ...readJSON<Partial<Config>>(CONFIG_FILE, {}) }
+// 旧版本的默认值是 Alt+Space（易与系统窗口菜单冲突），首次用新版本时把它挪到新默认值
+if (!config.hotkeyMigrated) {
+  if (config.hotkey === 'Alt+Space') config.hotkey = DEFAULT_HOTKEY
+  config.hotkeyMigrated = true
+  saveConfig()
+}
 ensureDir(USER_DIR)
 ensureDir(config.vaultPath)
 
 function saveConfig() {
   writeJSON(CONFIG_FILE, config)
+}
+
+/** 排版顺序这类改动发生在主进程，得主动推给界面，否则侧栏会拿旧顺序渲染 */
+function notifyConfig() {
+  win?.webContents.send('config:changed', config)
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +294,137 @@ function uniqueName(dir: string, base: string) {
 }
 
 // ---------------------------------------------------------------------------
+// 侧栏顺序 / 移动
+// ---------------------------------------------------------------------------
+const relOf = (abs: string) => relative(config.vaultPath, abs).split('\\').join('/')
+const dirRelOf = (rel: string) => {
+  const cut = rel.lastIndexOf('/')
+  return cut >= 0 ? rel.slice(0, cut) : ''
+}
+
+/**
+ * 某个目录下的条目（子文件夹 + markdown），按 config.order 里登记的先后排；
+ * 没登记过的排在后面，按「文件夹优先、再按名称」补位。
+ */
+async function listDirEntries(relDir: string): Promise<string[]> {
+  const abs = relDir ? safePath(relDir) : config.vaultPath
+  let entries: Dirent[] = []
+  try {
+    entries = await fsp.readdir(abs, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const dirSet = new Set<string>()
+  const all: string[] = []
+  for (const entry of entries) {
+    if (entry.name.startsWith('.') || IGNORED.has(entry.name)) continue
+    const rel = relDir ? `${relDir}/${entry.name}` : entry.name
+    if (entry.isDirectory()) {
+      dirSet.add(rel)
+      all.push(rel)
+    } else if (/\.(md|markdown|mdx|txt)$/i.test(entry.name)) {
+      all.push(rel)
+    }
+  }
+  const pref = config.order?.[relDir] || []
+  const rank = (p: string) => {
+    const i = pref.indexOf(p)
+    return i < 0 ? Number.MAX_SAFE_INTEGER : i
+  }
+  all.sort((a, b) => {
+    const ra = rank(a)
+    const rb = rank(b)
+    if (ra !== rb) return ra - rb
+    const da = dirSet.has(a) ? 0 : 1
+    const db = dirSet.has(b) ? 0 : 1
+    if (da !== db) return da - db
+    return a.localeCompare(b, 'zh-Hans-CN')
+  })
+  return all
+}
+
+/** 文件夹整体改名/移动后，把 order 里的键与值一起改写 */
+function remapOrder(from: string, to: string) {
+  const map = (p: string) => (p === from || p.startsWith(`${from}/`) ? to + p.slice(from.length) : p)
+  const next: Record<string, string[]> = {}
+  Object.entries(config.order || {}).forEach(([k, v]) => {
+    next[map(k)] = v.map(map)
+  })
+  config.order = next
+}
+
+/** 改写 config 里记录的标签与上次文档路径 */
+function remapOpenPaths(from: string, to: string) {
+  const map = (p: string) => (p === from || p.startsWith(`${from}/`) ? to + p.slice(from.length) : p)
+  config.openTabs = (config.openTabs || []).map(map)
+  if (config.lastDoc) config.lastDoc = map(config.lastDoc)
+}
+
+/** 新建的条目排到所在目录最前面，符合「刚建完就看得到」的直觉 */
+function unshiftOrder(relDir: string, rel: string) {
+  const order = { ...(config.order || {}) }
+  order[relDir] = [rel, ...(order[relDir] || []).filter((p) => p !== rel)]
+  config.order = order
+  saveConfig()
+  notifyConfig()
+}
+
+/** 删除条目后，把它从排序表里摘掉，避免排序表无限膨胀 */
+function dropFromOrder(rel: string) {
+  const dir = dirRelOf(rel)
+  const order = { ...(config.order || {}) }
+  if (order[dir]) order[dir] = order[dir].filter((p) => p !== rel)
+  Object.keys(order).forEach((k) => {
+    if (k === rel || k.startsWith(`${rel}/`)) delete order[k]
+  })
+  config.order = order
+  saveConfig()
+  notifyConfig()
+}
+
+async function moveDocTo(rel: string, targetDir: string): Promise<string> {
+  const abs = safePath(rel)
+  const destDir = targetDir ? safePath(targetDir) : config.vaultPath
+  ensureDir(destDir)
+  const dest = join(destDir, basename(abs))
+  if (resolve(dest) === resolve(abs)) return rel
+  if (existsSync(dest)) throw new Error('目标文件夹里已有同名文件')
+  await fsp.rename(abs, dest)
+  return relOf(dest)
+}
+
+async function moveFolderTo(rel: string, targetDir: string): Promise<string> {
+  const abs = safePath(rel)
+  const name = basename(abs)
+  if (targetDir === rel || targetDir.startsWith(`${rel}/`)) throw new Error('不能把文件夹移动到它自己里面')
+  const destDir = targetDir ? safePath(targetDir) : config.vaultPath
+  const dest = join(destDir, name)
+  if (resolve(dest) === resolve(abs)) return rel
+  if (existsSync(dest)) throw new Error(`目标位置已有同名文件夹「${name}」`)
+  await fsp.rename(abs, dest)
+  const next = relOf(dest)
+  remapOpenPaths(rel, next)
+  remapOrder(rel, next)
+  notifyConfig()
+  return next
+}
+
+/** 拖拽落位：必要时先移动，再把条目插到目标目录的第 index 位 */
+async function arrangeEntry(kind: 'doc' | 'dir', rel: string, targetDir: string, index: number) {
+  const fromDir = dirRelOf(rel)
+  const next = fromDir === targetDir ? rel : kind === 'doc' ? await moveDocTo(rel, targetDir) : await moveFolderTo(rel, targetDir)
+  const list = (await listDirEntries(targetDir)).filter((p) => p !== next)
+  const at = Math.max(0, Math.min(Math.trunc(index) || 0, list.length))
+  list.splice(at, 0, next)
+  const order = { ...(config.order || {}) }
+  order[targetDir] = list
+  if (fromDir !== targetDir) order[fromDir] = await listDirEntries(fromDir)
+  config.order = order
+  saveConfig()
+  return next
+}
+
+// ---------------------------------------------------------------------------
 // 剪贴板历史
 // ---------------------------------------------------------------------------
 interface ClipItem {
@@ -429,7 +577,7 @@ function createTray() {
   const iconPath = join(RES_DIR, 'tray.png')
   const image = nativeImage.createFromPath(iconPath)
   tray = new Tray(image.isEmpty() ? nativeImage.createEmpty() : image.resize({ width: 16, height: 16 }))
-  tray.setToolTip('Inkwell · Alt+Space 召出')
+  tray.setToolTip(`Inkwell · ${config.hotkey} 召出`)
   const rebuild = () => {
     const menu = Menu.buildFromTemplate([
       { label: '显示 Inkwell', click: () => showWindow() },
@@ -478,8 +626,8 @@ function registerHotkey(accel: string): string | null {
     }
   }
   if (tryRegister(accel)) return accel
-  // Alt+Space 常被系统窗口菜单占用，依次退让到更少冲突的组合
-  for (const fallback of ['Ctrl+Alt+Space', 'Alt+M', 'Ctrl+Alt+M']) {
+  // Alt+M 被占用时依次退让到更少冲突的组合
+  for (const fallback of ['Ctrl+Alt+M', 'Ctrl+Shift+M', 'Alt+Space']) {
     if (fallback !== accel && tryRegister(fallback)) return fallback
   }
   return null
@@ -525,6 +673,7 @@ function setupIPC() {
       const active = registerHotkey(patch.hotkey)
       config.hotkey = active || prevHotkey
       if (!active) registerHotkey(prevHotkey)
+      tray?.setToolTip(`Inkwell · ${config.hotkey} 召出`)
       saveConfig()
     }
     if (patch.alwaysOnTop !== undefined) win?.setAlwaysOnTop(config.alwaysOnTop, 'floating')
@@ -546,19 +695,28 @@ function setupIPC() {
     const abs = join(parentAbs, raw)
     if (existsSync(abs)) throw new Error(`「${raw}」已存在`)
     await fsp.mkdir(abs, { recursive: true })
-    return relative(config.vaultPath, abs).split('\\').join('/')
+    const rel = relative(config.vaultPath, abs).split('\\').join('/')
+    unshiftOrder(payload?.parent || '', rel)
+    return rel
   })
 
-  ipcMain.handle('doc:move', async (_e, rel: string, targetDir: string) => {
-    const abs = safePath(rel)
-    const destDir = targetDir ? safePath(targetDir) : config.vaultPath
-    ensureDir(destDir)
-    const dest = join(destDir, basename(abs))
-    if (resolve(dest) === resolve(abs)) return rel
-    if (existsSync(dest)) throw new Error('目标文件夹里已有同名文件')
-    await fsp.rename(abs, dest)
-    return relative(config.vaultPath, dest).split('\\').join('/')
-  })
+  ipcMain.handle('doc:move', async (_e, rel: string, targetDir: string) => moveDocTo(rel, targetDir))
+
+  // 拖拽落位：同一句里完成「跨目录移动 + 手动排序」
+  ipcMain.handle(
+    'vault:arrange',
+    async (_e, payload: { kind: 'doc' | 'dir'; path: string; targetDir?: string; index?: number }) => {
+      const rel = await arrangeEntry(payload.kind, payload.path, payload.targetDir || '', Number(payload.index) || 0)
+      config.openTabs = config.openTabs || []
+      saveConfig()
+      return {
+        rel,
+        order: config.order,
+        docs: await scanVault(),
+        folders: await scanFolders()
+      }
+    }
+  )
 
   ipcMain.handle('vault:pick', async () => {
     if (!win) return null
@@ -598,7 +756,9 @@ function setupIPC() {
     const name = uniqueName(dirAbs, base)
     const abs = join(dirAbs, name)
     await fsp.writeFile(abs, `# ${payload.title?.trim() || '未命名文档'}\n\n`, 'utf-8')
-    return relative(config.vaultPath, abs).split('\\').join('/')
+    const rel = relative(config.vaultPath, abs).split('\\').join('/')
+    unshiftOrder(payload.dir || '', rel)
+    return rel
   })
 
   ipcMain.handle('doc:rename', async (_e, rel: string, nextName: string) => {
@@ -606,12 +766,18 @@ function setupIPC() {
     const clean = nextName.replace(/[\\/:*?"<>|]/g, '').trim() || '未命名'
     const nextAbs = join(dirname(abs), clean.endsWith('.md') ? clean : `${clean}.md`)
     await fsp.rename(abs, nextAbs)
-    return relative(config.vaultPath, nextAbs).split('\\').join('/')
+    const next = relative(config.vaultPath, nextAbs).split('\\').join('/')
+    remapOrder(rel, next)
+    remapOpenPaths(rel, next)
+    saveConfig()
+    notifyConfig()
+    return next
   })
 
   ipcMain.handle('doc:delete', async (_e, rel: string) => {
     const abs = safePath(rel)
     await shell.trashItem(abs)
+    dropFromOrder(rel)
     return true
   })
 
@@ -645,10 +811,8 @@ function setupIPC() {
     await fsp.rename(abs, dest)
     const next = relative(config.vaultPath, dest).split('\\').join('/')
     // 同步改写已打开标签里位于该文件夹的路径
-    const old = rel.replace(/\/+$/, '')
-    const remap = (p: string) => (p === old || p.startsWith(`${old}/`) ? next + p.slice(old.length) : p)
-    config.openTabs = (config.openTabs || []).map(remap)
-    if (config.lastDoc) config.lastDoc = remap(config.lastDoc)
+    remapOpenPaths(rel.replace(/\/+$/, ''), next)
+    remapOrder(rel.replace(/\/+$/, ''), next)
     saveConfig()
     return next
   })
@@ -658,6 +822,7 @@ function setupIPC() {
     const inside = await fsp.readdir(abs).catch(() => ['x'])
     if (inside.length > 0) throw new Error('文件夹不是空的，先把文档移出去')
     await shell.trashItem(abs)
+    dropFromOrder(rel)
     return true
   })
 

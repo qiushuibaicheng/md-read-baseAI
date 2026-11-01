@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { Icon } from './Icons'
 import { relativeTime } from '../lib/markdown'
 import type { ClipItem, DocMeta, Snippet, ViewKey } from '../lib/types'
@@ -13,8 +13,12 @@ interface Props {
   onOpen: (path: string) => void
   onNew: (dir?: string) => void
   folders: string[]
-  onNewFolder: (parent: string | undefined, name: string) => Promise<boolean>
+  /** 手动排序表：目录相对路径 → 条目相对路径顺序 */
+  order: Record<string, string[]>
+  /** 拖拽落位：kind 区分文档与文件夹，index 是去掉被拖项之后的目标下标 */
+  onArrange: (payload: { kind: 'doc' | 'dir'; path: string; targetDir: string; index: number }) => void
   onMove: (path: string, targetDir: string) => void
+  onNewFolder: (parent: string | undefined, name: string) => Promise<boolean>
   onRevealFolder: (rel: string) => void
   onRenameFolder: (rel: string, name: string) => void
   onDeleteFolder: (rel: string) => void
@@ -40,12 +44,48 @@ const dirOf = (path: string) => {
 const baseName = (path: string) => path.slice(path.lastIndexOf('/') + 1)
 const depthOf = (path: string) => path.split('/').length - 1
 
+interface FolderNode {
+  path: string
+  name: string
+  dirs: FolderNode[]
+  docs: DocMeta[]
+  /** 文件夹与文档混排后的最终顺序 */
+  entries: Entry[]
+}
+type Entry = { kind: 'dir'; path: string; node: FolderNode } | { kind: 'doc'; path: string; doc: DocMeta }
+type DropSpot = { mode: 'inside'; dir: string } | { mode: 'line'; dir: string; index: number }
 
 const TABS: { key: ViewKey; label: string; icon: string }[] = [
   { key: 'notes', label: '文档', icon: 'doc' },
   { key: 'snippets', label: '片段', icon: 'snippet' },
   { key: 'clipboard', label: '剪贴板', icon: 'clipboard' }
 ]
+
+/** 按 order 表排，没登记过的排在后面：文件夹优先，再按名称 */
+function sortEntries(node: FolderNode, order: Record<string, string[]>) {
+  const pref = order[node.path] || []
+  const rank = (p: string) => {
+    const i = pref.indexOf(p)
+    return i < 0 ? Number.MAX_SAFE_INTEGER : i
+  }
+  const all: Entry[] = [
+    ...node.dirs.map((n) => ({ kind: 'dir' as const, path: n.path, node: n })),
+    ...node.docs.map((d) => ({ kind: 'doc' as const, path: d.path, doc: d }))
+  ]
+  all.sort((a, b) => {
+    const ra = rank(a.path)
+    const rb = rank(b.path)
+    if (ra !== rb) return ra - rb
+    const ka = a.kind === 'dir' ? 0 : 1
+    const kb = b.kind === 'dir' ? 0 : 1
+    if (ka !== kb) return ka - kb
+    const na = a.kind === 'dir' ? a.node.name : a.doc.name
+    const nb = b.kind === 'dir' ? b.node.name : b.doc.name
+    return na.localeCompare(nb, 'zh-Hans-CN')
+  })
+  node.entries = all
+  node.dirs.forEach((n) => sortEntries(n, order))
+}
 
 export default function Sidebar(props: Props) {
   const { view, setView, docs, active, query, setQuery } = props
@@ -58,9 +98,10 @@ export default function Sidebar(props: Props) {
   const [newMenu, setNewMenu] = useState(false)
   const [newFolderIn, setNewFolderIn] = useState<string | null>(null)
   const [folderDraft, setFolderDraft] = useState('')
-  /** 正在拖的文档路径 / 当前悬停的落点（'' 表示根目录） */
-  const [dragPath, setDragPath] = useState<string | null>(null)
-  const [dropDir, setDropDir] = useState<string | null>(null)
+  /** 正在拖的条目（文档或文件夹） */
+  const [drag, setDrag] = useState<{ kind: 'doc' | 'dir'; path: string } | null>(null)
+  /** 落点：插到某目录的第 index 位，或放进某个文件夹 */
+  const [drop, setDrop] = useState<DropSpot | null>(null)
   const [moveMenu, setMoveMenu] = useState<{ path: string; x: number; y: number } | null>(null)
   const [folderMenu, setFolderMenu] = useState<{ path: string; x: number; y: number } | null>(null)
   const [renamingFolder, setRenamingFolder] = useState<string | null>(null)
@@ -93,24 +134,17 @@ export default function Sidebar(props: Props) {
     return docs.filter((d) => d.title.toLowerCase().includes(q) || d.name.toLowerCase().includes(q))
   }, [docs, query])
 
-  interface FolderNode {
-    path: string
-    name: string
-    docs: DocMeta[]
-    children: FolderNode[]
-  }
-
-  const tree = useMemo(() => {
+  const { root, nodes } = useMemo(() => {
     const map = new Map<string, FolderNode>()
-    const root: FolderNode = { path: '', name: '', docs: [], children: [] }
-    map.set('', root)
+    const base: FolderNode = { path: '', name: '', dirs: [], docs: [], entries: [] }
+    map.set('', base)
     const ensure = (path: string): FolderNode => {
       const hit = map.get(path)
       if (hit) return hit
       const cut = path.lastIndexOf('/')
       const parent = ensure(cut >= 0 ? path.slice(0, cut) : '')
-      const node: FolderNode = { path, name: cut >= 0 ? path.slice(cut + 1) : path, docs: [], children: [] }
-      parent.children.push(node)
+      const node: FolderNode = { path, name: cut >= 0 ? path.slice(cut + 1) : path, dirs: [], docs: [], entries: [] }
+      parent.dirs.push(node)
       map.set(path, node)
       return node
     }
@@ -122,11 +156,12 @@ export default function Sidebar(props: Props) {
       const cut = d.path.lastIndexOf('/')
       ensure(cut >= 0 ? d.path.slice(0, cut) : '').docs.push(d)
     })
-    return root
-  }, [props.folders, filtered])
+    sortEntries(base, props.order)
+    return { root: base, nodes: map }
+  }, [props.folders, filtered, props.order])
 
-  const countDocs = (node: FolderNode): number =>
-    node.docs.length + node.children.reduce((sum, c) => sum + countDocs(c), 0)
+  const totalDocs = (node: FolderNode): number =>
+    node.docs.length + node.dirs.reduce((sum, c) => sum + totalDocs(c), 0)
 
   const toggleFolder = (path: string) => {
     setCollapsed((prev) => {
@@ -160,22 +195,94 @@ export default function Sidebar(props: Props) {
     setRenaming(null)
   }
 
-  const renderDoc = (doc: DocMeta, depth: number) => (
+  // ---------------------------------------------------------------- 拖拽
+  /** 不能拖进自己，也不能拖进自己的子孙目录 */
+  const canDropInto = (targetDir: string) => {
+    if (!drag) return false
+    if (targetDir === drag.path) return false
+    if (drag.kind === 'dir' && targetDir.startsWith(`${drag.path}/`)) return false
+    return true
+  }
+
+  const beginDrag = (kind: 'doc' | 'dir', path: string, e: React.DragEvent) => {
+    setDrag({ kind, path })
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', path)
+  }
+
+  const endDrag = () => {
+    setDrag(null)
+    setDrop(null)
+  }
+
+  const commitDrop = (spot: DropSpot | null) => {
+    const src = drag
+    setDrag(null)
+    setDrop(null)
+    if (!src || !spot) return
+    if (spot.mode === 'inside') {
+      if (!canDropInto(spot.dir)) return
+      props.onArrange({ kind: src.kind, path: src.path, targetDir: spot.dir, index: 0 })
+      return
+    }
+    const node = nodes.get(spot.dir)
+    if (!node) return
+    // spot.index 是「还包含被拖项」的列表下标，先把它摘出去再定位
+    const index =
+      dirOf(src.path) === spot.dir
+        ? node.entries.slice(0, spot.index).filter((e) => e.path !== src.path).length
+        : spot.index
+    props.onArrange({ kind: src.kind, path: src.path, targetDir: spot.dir, index })
+  }
+
+  /** 文档行：上半插入到它前面，下半插入到它后面 */
+  const spotOnDoc = (e: React.DragEvent<HTMLDivElement>, parentDir: string, index: number): DropSpot => {
+    const rect = e.currentTarget.getBoundingClientRect()
+    const ratio = (e.clientY - rect.top) / Math.max(1, rect.height)
+    return { mode: 'line', dir: parentDir, index: ratio < 0.5 ? index : index + 1 }
+  }
+
+  /** 文件夹行：上 28% 插到前面、下 28% 插到后面、中间放进文件夹 */
+  const spotOnFolder = (
+    e: React.DragEvent<HTMLDivElement>,
+    node: FolderNode,
+    parentDir: string,
+    index: number
+  ): DropSpot | null => {
+    const rect = e.currentTarget.getBoundingClientRect()
+    const ratio = (e.clientY - rect.top) / Math.max(1, rect.height)
+    if (ratio < 0.28) return canDropInto(parentDir) ? { mode: 'line', dir: parentDir, index } : null
+    if (ratio > 0.72) return canDropInto(parentDir) ? { mode: 'line', dir: parentDir, index: index + 1 } : null
+    return canDropInto(node.path) ? { mode: 'inside', dir: node.path } : null
+  }
+
+  const renderLine = (dirPath: string, index: number, depth: number) => {
+    if (!drop || drop.mode !== 'line' || drop.dir !== dirPath || drop.index !== index) return null
+    return <div className="drop-line" style={{ marginLeft: 10 + depth * 13 }} />
+  }
+
+  // ---------------------------------------------------------------- 渲染
+  const renderDoc = (doc: DocMeta, parentDir: string, index: number, depth: number) => (
     <div
       key={doc.path}
-      className={`doc-item${active === doc.path ? ' is-active' : ''}${dragPath === doc.path ? ' is-dragging' : ''}`}
+      className={`doc-item${active === doc.path ? ' is-active' : ''}${drag?.path === doc.path ? ' is-dragging' : ''}`}
       style={depth ? { paddingLeft: 10 + depth * 13 } : undefined}
       onClick={() => props.onOpen(doc.path)}
       onDoubleClick={() => startRename(doc)}
       draggable
-      onDragStart={(e) => {
-        setDragPath(doc.path)
-        e.dataTransfer.effectAllowed = 'move'
-        e.dataTransfer.setData('text/plain', doc.path)
+      onDragStart={(e) => beginDrag('doc', doc.path, e)}
+      onDragEnd={endDrag}
+      onDragOver={(e) => {
+        if (!drag) return
+        e.preventDefault()
+        e.stopPropagation()
+        e.dataTransfer.dropEffect = 'move'
+        setDrop(spotOnDoc(e, parentDir, index))
       }}
-      onDragEnd={() => {
-        setDragPath(null)
-        setDropDir(null)
+      onDrop={(e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        commitDrop(spotOnDoc(e, parentDir, index))
       }}
       title={doc.path}
     >
@@ -258,7 +365,7 @@ export default function Sidebar(props: Props) {
 
   const renderFolderInput = (parent: string, depth: number) => (
     <div className="folder-new" style={{ paddingLeft: 12 + depth * 13 }}>
-      <Icon name="folder" size={12} />
+      <Icon name="folder" size={13} />
       <input
         autoFocus
         value={folderDraft}
@@ -279,122 +386,140 @@ export default function Sidebar(props: Props) {
     </div>
   )
 
-  const renderFolder = (node: FolderNode, depth: number): React.ReactNode => (
-    <>
-      {node.children.map((child) => {
-        const open = !collapsed.has(child.path)
-        const isDrop = dropDir === child.path && !!dragPath
-        const holdsActive = activeDir === child.path || activeDir.startsWith(`${child.path}/`)
-        return (
-          <div key={child.path} className="folder-block">
-            <div
-              className={`folder-row${open ? ' is-open' : ''}${isDrop ? ' is-drop' : ''}${
-                holdsActive ? ' has-active' : ''
-              }`}
-              style={{ paddingLeft: 8 + depth * 13 }}
-              onClick={() => toggleFolder(child.path)}
-              onContextMenu={(e) => {
-                e.preventDefault()
+  const renderDir = (node: FolderNode, parentDir: string, index: number, depth: number) => {
+    const open = !collapsed.has(node.path)
+    const isDrop = drop?.mode === 'inside' && drop.dir === node.path
+    const holdsActive = activeDir === node.path || activeDir.startsWith(`${node.path}/`)
+    return (
+      <div className="folder-block">
+        <div
+          className={`folder-row${open ? ' is-open' : ''}${isDrop ? ' is-drop' : ''}${holdsActive ? ' has-active' : ''}${
+            drag?.path === node.path ? ' is-dragging' : ''
+          }`}
+          style={{ paddingLeft: 8 + depth * 13 }}
+          onClick={() => toggleFolder(node.path)}
+          draggable
+          onDragStart={(e) => beginDrag('dir', node.path, e)}
+          onDragEnd={endDrag}
+          onDragOver={(e) => {
+            if (!drag) return
+            const spot = spotOnFolder(e, node, parentDir, index)
+            if (!spot) return
+            e.preventDefault()
+            e.stopPropagation()
+            e.dataTransfer.dropEffect = 'move'
+            setDrop(spot)
+          }}
+          onDrop={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            commitDrop(spotOnFolder(e, node, parentDir, index))
+          }}
+          onContextMenu={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            setFolderMenu({
+              path: node.path,
+              x: Math.min(e.clientX, window.innerWidth - 200),
+              y: Math.min(e.clientY, window.innerHeight - 220)
+            })
+          }}
+          title={`${node.path}（拖动可移动/排序）`}
+        >
+          <span className="folder-caret">
+            <Icon name="chevron" size={12} />
+          </span>
+          <span className="folder-icon">
+            <Icon name={open ? 'folder-open' : 'folder'} size={15} />
+          </span>
+          {renamingFolder === node.path ? (
+            <input
+              className="rename-input"
+              autoFocus
+              value={folderRenameDraft}
+              onClick={(e) => e.stopPropagation()}
+              onChange={(e) => setFolderRenameDraft(e.target.value)}
+              onBlur={() => {
+                if (folderRenameDraft.trim()) props.onRenameFolder(node.path, folderRenameDraft.trim())
+                setRenamingFolder(null)
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  if (folderRenameDraft.trim()) props.onRenameFolder(node.path, folderRenameDraft.trim())
+                  setRenamingFolder(null)
+                }
+                if (e.key === 'Escape') setRenamingFolder(null)
+              }}
+            />
+          ) : (
+            <span className="folder-name">{node.name}</span>
+          )}
+          <span className="folder-count">{totalDocs(node) || ''}</span>
+          <span className="folder-actions">
+            <button
+              className="icon-btn tiny"
+              title="在此新建文档"
+              onClick={(e) => {
                 e.stopPropagation()
-                setFolderMenu({
-                  path: child.path,
-                  x: Math.min(e.clientX, window.innerWidth - 200),
-                  y: Math.min(e.clientY, window.innerHeight - 220)
+                setCollapsed((prev) => {
+                  const next = new Set(prev)
+                  next.delete(node.path)
+                  return next
+                })
+                props.onNew(node.path)
+              }}
+            >
+              <Icon name="plus" size={12} />
+            </button>
+            <button
+              className="icon-btn tiny"
+              title="新建子文件夹"
+              onClick={(e) => {
+                e.stopPropagation()
+                setFolderDraft('')
+                setNewFolderIn(node.path)
+                setCollapsed((prev) => {
+                  const next = new Set(prev)
+                  next.delete(node.path)
+                  return next
                 })
               }}
-              onDragOver={(e) => {
-                if (!dragPath) return
-                e.preventDefault()
-                e.stopPropagation()
-                e.dataTransfer.dropEffect = 'move'
-                setDropDir(child.path)
-              }}
-              onDrop={(e) => {
-                e.preventDefault()
-                e.stopPropagation()
-                const moving = dragPath || e.dataTransfer.getData('text/plain')
-                setDragPath(null)
-                setDropDir(null)
-                if (moving) props.onMove(moving, child.path)
-              }}
-              title={`${child.path}（可以把文档拖进来）`}
             >
-              <span className="folder-caret">
-                <Icon name="chevron" size={11} />
-              </span>
-              <Icon name="folder" size={13} />
-              {renamingFolder === child.path ? (
-                <input
-                  className="rename-input"
-                  autoFocus
-                  value={folderRenameDraft}
-                  onClick={(e) => e.stopPropagation()}
-                  onChange={(e) => setFolderRenameDraft(e.target.value)}
-                  onBlur={() => {
-                    if (folderRenameDraft.trim()) props.onRenameFolder(child.path, folderRenameDraft.trim())
-                    setRenamingFolder(null)
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      if (folderRenameDraft.trim()) props.onRenameFolder(child.path, folderRenameDraft.trim())
-                      setRenamingFolder(null)
-                    }
-                    if (e.key === 'Escape') setRenamingFolder(null)
-                  }}
-                />
-              ) : (
-                <span className="folder-name">{child.name}</span>
-              )}
-              <span className="folder-count">{countDocs(child)}</span>
-              <span className="folder-actions">
-                <button
-                  className="icon-btn tiny"
-                  title="在此新建文档"
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    setCollapsed((prev) => {
-                      const next = new Set(prev)
-                      next.delete(child.path)
-                      return next
-                    })
-                    props.onNew(child.path)
-                  }}
-                >
-                  <Icon name="plus" size={11} />
-                </button>
-                <button
-                  className="icon-btn tiny"
-                  title="新建子文件夹"
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    setFolderDraft('')
-                    setNewFolderIn(child.path)
-                  }}
-                >
-                  <Icon name="folder-plus" size={11} />
-                </button>
-                <button
-                  className="icon-btn tiny"
-                  title="在资源管理器中打开"
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    props.onRevealFolder(child.path)
-                  }}
-                >
-                  <Icon name="external" size={11} />
-                </button>
-              </span>
-            </div>
-            {open && (
-              <>
-                {newFolderIn === child.path && renderFolderInput(child.path, depth + 1)}
-                {renderFolder(child, depth + 1)}
-              </>
-            )}
-          </div>
-        )
-      })}
-      {node.docs.map((d) => renderDoc(d, depth))}
+              <Icon name="folder-plus" size={12} />
+            </button>
+            <button
+              className="icon-btn tiny"
+              title="在资源管理器中打开"
+              onClick={(e) => {
+                e.stopPropagation()
+                props.onRevealFolder(node.path)
+              }}
+            >
+              <Icon name="external" size={12} />
+            </button>
+          </span>
+        </div>
+        {open && (
+          <>
+            {newFolderIn === node.path && renderFolderInput(node.path, depth + 1)}
+            {renderEntries(node, depth + 1)}
+          </>
+        )}
+      </div>
+    )
+  }
+
+  const renderEntries = (node: FolderNode, depth: number): React.ReactNode => (
+    <>
+      {node.entries.map((entry, i) => (
+        <Fragment key={entry.path}>
+          {renderLine(node.path, i, depth)}
+          {entry.kind === 'dir'
+            ? renderDir(entry.node, node.path, i, depth)
+            : renderDoc(entry.doc, node.path, i, depth)}
+        </Fragment>
+      ))}
+      {renderLine(node.path, node.entries.length, depth)}
     </>
   )
 
@@ -438,25 +563,47 @@ export default function Sidebar(props: Props) {
                 <>
                   <div className="menu-backdrop" onClick={() => setNewMenu(false)} />
                   <div className="new-menu">
+                    <div className="new-menu-head">新建到根目录</div>
                     <button
                       onClick={() => {
                         setNewMenu(false)
-                        props.onNew(activeDir || undefined)
+                        props.onNew(undefined)
                       }}
                     >
-                      <Icon name="doc" size={12} /> 新建文档
-                      {activeDir && <em>{baseName(activeDir)}</em>}
+                      <Icon name="doc" size={12} /> 新建文档 <em>根目录</em>
                     </button>
                     <button
                       onClick={() => {
                         setNewMenu(false)
                         setFolderDraft('')
-                        setNewFolderIn(activeDir || '')
+                        setNewFolderIn('')
                       }}
                     >
-                      <Icon name="folder-plus" size={12} /> 新建文件夹
-                      {activeDir && <em>{baseName(activeDir)}</em>}
+                      <Icon name="folder-plus" size={12} /> 新建文件夹 <em>根目录</em>
                     </button>
+                    {activeDir && (
+                      <>
+                        <div className="new-menu-sep" />
+                        <div className="new-menu-head">新建到「{baseName(activeDir)}」</div>
+                        <button
+                          onClick={() => {
+                            setNewMenu(false)
+                            props.onNew(activeDir)
+                          }}
+                        >
+                          <Icon name="doc" size={12} /> 新建文档 <em>{baseName(activeDir)}</em>
+                        </button>
+                        <button
+                          onClick={() => {
+                            setNewMenu(false)
+                            setFolderDraft('')
+                            setNewFolderIn(activeDir)
+                          }}
+                        >
+                          <Icon name="folder-plus" size={12} /> 新建文件夹 <em>{baseName(activeDir)}</em>
+                        </button>
+                      </>
+                    )}
                   </div>
                 </>
               )}
@@ -464,30 +611,25 @@ export default function Sidebar(props: Props) {
           </div>
 
           <div
-            className={`list${dragPath ? ' is-dragging-src' : ''}${dropDir === '' && dragPath ? ' is-drop-root' : ''}`}
+            className={`list${drag ? ' is-arranging' : ''}`}
             onDragOver={(e) => {
-              if (!dragPath) return
+              // 落在空白处 = 排到根目录末尾
+              if (!drag || !canDropInto('')) return
               e.preventDefault()
               e.dataTransfer.dropEffect = 'move'
-              setDropDir('')
+              setDrop({ mode: 'line', dir: '', index: root.entries.length })
             }}
             onDrop={(e) => {
-              if (!dragPath) return
+              if (!drag) return
               e.preventDefault()
-              const moving = dragPath
-              setDragPath(null)
-              setDropDir(null)
-              props.onMove(moving, '')
+              // 落在空白处 = 排到根目录末尾
+              commitDrop(canDropInto('') ? { mode: 'line', dir: '', index: root.entries.length } : null)
             }}
           >
             {newFolderIn === '' && renderFolderInput('', 0)}
             {filtered.length === 0 && props.folders.length === 0 && <div className="empty-hint">没有匹配的文档</div>}
-            {renderFolder(tree, 0)}
-            {dragPath && (
-              <div className="root-drop-hint">
-                <Icon name="folder" size={12} /> 拖到空白处 = 移到根目录
-              </div>
-            )}
+            {renderEntries(root, 0)}
+            {drag && <div className="root-drop-hint">拖到空白处 = 移到根目录末尾</div>}
           </div>
         </>
       )}

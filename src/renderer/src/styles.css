@@ -654,6 +654,10 @@ kbd {
   font-size: 10.5px;
   color: var(--txt-3);
   margin-top: 1px;
+  /* 文件名长的时候别折成三四行，行高会忽高忽低 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .doc-actions {
@@ -3927,18 +3931,28 @@ kbd {
 .folder-row {
   display: flex;
   align-items: center;
-  gap: 6px;
-  margin: 1px 6px;
-  padding: 5px 8px;
-  border-radius: var(--r-sm);
-  color: var(--txt-2);
-  font-size: 12.5px;
+  gap: 7px;
+  margin: 2px 6px;
+  min-height: 38px;
+  padding: 8px 8px 8px 6px;
+  border-radius: 8px;
+  color: var(--txt);
+  font-size: 13px;
+  font-weight: 500;
   cursor: pointer;
   user-select: none;
 }
 .folder-row:hover {
   background: var(--panel-hover);
-  color: var(--txt);
+}
+.folder-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  color: var(--txt-2);
+}
+.folder-row.is-open .folder-icon,
+.folder-row.has-active .folder-icon {
+  color: var(--acc);
 }
 .folder-caret {
   display: inline-flex;
@@ -3955,7 +3969,11 @@ kbd {
   text-overflow: ellipsis;
 }
 .folder-count {
-  font-size: 10.5px;
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--panel-hover);
+  font-size: 10px;
   color: var(--txt-3);
   font-variant-numeric: tabular-nums;
 }
@@ -4400,4 +4418,62 @@ kbd {
 }
 .toast.is-bad svg {
   color: var(--danger);
+}
+
+/* ==========================================================================
+   侧栏：拖拽排序落点 / 新建菜单分组
+   ========================================================================== */
+.folder-row.is-dragging,
+.doc-item.is-dragging {
+  opacity: 0.4;
+}
+.folder-row.is-drop {
+  background: var(--acc-soft);
+  color: var(--txt);
+  box-shadow: inset 0 0 0 1px var(--acc-line);
+}
+.folder-row.is-drop .folder-count {
+  opacity: 0.35;
+}
+/* 两行之间的插入指示线 */
+.drop-line {
+  position: relative;
+  height: 2px;
+  margin: 2px 8px 2px 0;
+  border-radius: 2px;
+  background: var(--acc);
+  box-shadow: 0 0 0 3px var(--acc-soft);
+  pointer-events: none;
+}
+.drop-line::before {
+  content: '';
+  position: absolute;
+  left: -3px;
+  top: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--acc);
+}
+.list.is-arranging .doc-item,
+.list.is-arranging .folder-row {
+  cursor: grabbing;
+}
+
+.new-menu-head {
+  padding: 5px 9px 3px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--txt-3);
+}
+.new-menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--line);
+}
+.folder-count:empty {
+  display: none;
+}
+.folder-count:empty {
+  display: none;
 }

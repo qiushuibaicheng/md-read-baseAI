@@ -19,6 +19,8 @@ export interface AppConfig {
   aiPanelWidth: number
   accent: string
   themeMode: 'dark' | 'light' | 'system'
+  /** 侧栏手动排序：目录相对路径 → 条目相对路径顺序 */
+  order: Record<string, string[]>
 }
 
 export interface ModelProfile {
@@ -129,6 +131,12 @@ export interface InkAPI {
   renameFolder(rel: string, name: string): Promise<string>
   deleteFolder(rel: string): Promise<boolean>
   moveDoc(rel: string, targetDir: string): Promise<string>
+  arrange(payload: {
+    kind: 'doc' | 'dir'
+    path: string
+    targetDir?: string
+    index?: number
+  }): Promise<{ rel: string; order: Record<string, string[]>; docs: DocMeta[]; folders: string[] }>
   pickVault(): Promise<{ config: AppConfig; docs: DocMeta[] } | null>
   vaultPath(): Promise<string>
   readDoc(rel: string): Promise<{ content: string; mtime: number }>
