@@ -493,8 +493,23 @@ async function moveEntryAny(from: string, toDir: string, newName?: string): Prom
   if (resolve(dest) === resolve(abs)) return from
   if (existsSync(dest)) throw new Error(`目标位置已有同名${isDir ? '文件夹' : '文档'}「${name}」`)
 
+  // 移动会改变相对链接的基准，而 AI 的 move_entry 也走这里：
+  // 入链快照必须在 rename 之前取，挪完旧路径就解析不到，边会退化成断链。
+  const snapshot = await linkIndex.snapshotInbound()
+  const innerDocs = isDir
+    ? (await linkIndex.list())
+        .map((d) => d.path)
+        .filter((p) => p.startsWith(`${from}/`))
+    : []
+
   await fsp.rename(abs, dest)
   const next = relOf(dest)
+
+  // 文件夹里的每篇文档路径都变了，逐条重算指向它们的链接
+  const moved = new Map<string, string>([[from, next]])
+  for (const p of innerDocs) moved.set(p, next + p.slice(from.length))
+  await relinkAfterMove(snapshot, moved, from)
+
   const fromDir = dirRelOf(from)
 
   remapOrder(from, next)
