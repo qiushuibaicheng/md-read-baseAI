@@ -36,10 +36,12 @@ const api = {
   linksBroken: () => ipcRenderer.invoke('links:broken'),
   linksStats: () => ipcRenderer.invoke('links:stats'),
   linksGraph: (rel: string, depth = 1) => ipcRenderer.invoke('links:graph', rel, depth),
-  linksResolve: (from: string, href: string, text?: string) =>
-    ipcRenderer.invoke('links:resolve', from, href, text),
+  linksResolve: (from: string, href: string) => ipcRenderer.invoke('links:resolve', from, href),
   linksReindex: () => ipcRenderer.invoke('links:index'),
   onLinksChanged: (cb: () => void) => on('links:changed', cb),
+  onVaultRelinked: (
+    cb: (info: { from: string; count: number; files: number; skipped: number; paths: string[] }) => void
+  ) => on('vault:relinked', cb),
   saveSnippets: (list: unknown) => ipcRenderer.invoke('snippets:save', list),
 
   copyText: (text: string) => ipcRenderer.invoke('clipboard:write', text),

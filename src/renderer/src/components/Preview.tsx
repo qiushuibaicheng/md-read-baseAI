@@ -1,6 +1,20 @@
 import { useEffect, useRef } from 'react'
 import { hydrateRich } from '../lib/rich'
 
+/** 锚点跳转：先按 id 找，再按标题文字找（中文标题的锚点通常是文字） */
+function jumpToAnchor(key: string) {
+  if (!key) return
+  const box = document.querySelector('.preview.markdown-body')
+  if (!box) return
+  const byId = box.querySelector(`#${CSS.escape(key)}`) as HTMLElement | null
+  const hit =
+    byId ||
+    ([...box.querySelectorAll('h1,h2,h3,h4,h5,h6')].find(
+      (h) => (h.textContent || '').trim() === key
+    ) as HTMLElement | undefined)
+  hit?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
 interface Props {
   html: string
   fontSize: number
@@ -83,13 +97,17 @@ export default function Preview({
       const docLink = anchor.getAttribute('data-doc-link')
       if (docLink) {
         e.preventDefault()
-        onDocLink?.(docLink, anchor.getAttribute('data-doc-anchor') || undefined, anchor.textContent || undefined)
+        onDocLink?.(
+          docLink,
+          anchor.getAttribute('data-doc-anchor') || undefined,
+          anchor.textContent || undefined
+        )
         return
       }
       const href = anchor.getAttribute('href') || ''
       if (href.startsWith('#')) {
         e.preventDefault()
-        document.getElementById(href.slice(1))?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        jumpToAnchor(href.slice(1))
       } else if (/^https?:/i.test(href)) {
         e.preventDefault()
         window.api.openExternal(href)

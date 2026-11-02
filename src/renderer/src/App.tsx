@@ -373,21 +373,50 @@ export default function App() {
     toastTimer.current = setTimeout(() => setToast(null), bad ? 2600 : 1700)
   }, [])
 
-  /** 点预览里的库内链接：交给主进程解析，再跳过去。text 是链接显示文字，跟索引走同一套判定 */
+  // 移动/改名后主进程自动改写了链接：把受影响的文档重新读一遍，并交代改了多少处
+  useEffect(
+    () =>
+      window.api.onVaultRelinked(async (info) => {
+        const fresh = info.paths.filter((p) => !dirty[p])
+        for (const p of fresh) {
+          if (!tabs.includes(p)) {
+            // 没打开的清掉缓存，下次打开时重新读
+            setContents((c) => {
+              const next = { ...c }
+              delete next[p]
+              return next
+            })
+            continue
+          }
+          try {
+            const r = await window.api.readDoc(p)
+            setContents((c) => ({ ...c, [p]: r.content }))
+          } catch {
+            /* 文档可能刚被关掉 */
+          }
+        }
+        const held = info.paths.length - fresh.length
+        showToast(
+          `已更新 ${info.count} 处链接` + (held ? `，${held} 篇有未保存内容待手动刷新` : '')
+        )
+      }),
+    [dirty, tabs, showToast]
+  )
+
+  /** 点预览里的库内链接：交给主进程按 Markdown 路径解析，再跳过去 */
   const handleDocLink = useCallback(
     async (raw: string, anchor?: string, text?: string) => {
       if (!active) return
       const name = linkLabel(raw, text)
       try {
-        const res = await window.api.linksResolve(active, raw, text)
+        const res = await window.api.linksResolve(active, raw)
         if (!res.path) {
-          const cand = (res.candidates || []).slice(0, 3).join(' / ')
-          showToast(
-            res.reason === 'ambiguous'
-              ? `「${name}」同名多篇，未自动跳转${cand ? `：${cand}` : ''}`
-              : `库里找不到「${name}」`,
-            true
-          )
+          if (res.reason === 'ambiguous') {
+            const cand = (res.candidates || []).slice(0, 3).join(' / ')
+            showToast(`「${name}」对应多个文件，未跳转${cand ? `：${cand}` : ''}`, true)
+          } else {
+            showToast(`「${name}」指向的文件不存在`, true)
+          }
           return
         }
         openDoc(res.path)

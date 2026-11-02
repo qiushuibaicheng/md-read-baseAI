@@ -179,7 +179,6 @@ export function formatLinkGraph(g: {
   out: {
     raw: string
     line: number
-    wiki: boolean
     toSummary?: string
     target: { path: string | null; reason: string; candidates?: string[] }
   }[]

@@ -124,7 +124,6 @@ export interface LinkEdge {
   text: string
   line: number
   anchor?: string
-  wiki: boolean
   target: { path: string | null; reason: LinkReason; candidates?: string[] }
   toSummary?: string
 }
@@ -230,11 +229,14 @@ export interface InkAPI {
   ): Promise<{ path: string; title: string; summary: string; hop: number; dir: 'out' | 'in' }[]>
   linksResolve(
     from: string,
-    href: string,
-    text?: string
+    href: string
   ): Promise<{ path: string | null; anchor?: string; reason: LinkReason; candidates?: string[] }>
   linksReindex(): Promise<LinkStats>
   onLinksChanged(cb: () => void): () => void
+  /** 移动/改名后自动改写了链接 */
+  onVaultRelinked(
+    cb: (info: { from: string; count: number; files: number; skipped: number; paths: string[] }) => void
+  ): () => void
   saveSnippets(list: Snippet[]): Promise<boolean>
   copyText(text: string): Promise<boolean>
   readClipboard(): Promise<string>

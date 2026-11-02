@@ -122,7 +122,6 @@ export interface LinkEdge {
   text: string
   line: number
   anchor?: string
-  wiki: boolean
   target: { path: string | null; reason: LinkReason; candidates?: string[] }
   toSummary?: string
 }

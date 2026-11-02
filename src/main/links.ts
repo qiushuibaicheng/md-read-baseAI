@@ -30,9 +30,9 @@ export interface LinkEdge {
   text: string
   /** 1 起始的行号 */
   line: number
+  /** 该行内的字符偏移（0 起始），改写链接时用来精确落刀 */
+  col: number
   anchor?: string
-  /** 是否为 [[双链]] 写法 */
-  wiki: boolean
   target: LinkTarget
   /** 目标文档的一句话摘要，解析成功时才有 */
   toSummary?: string
@@ -42,6 +42,7 @@ export interface InboundEdge {
   path: string
   title: string
   line: number
+  col: number
   text: string
   raw: string
   /** 引用方的一句话摘要 */
@@ -81,9 +82,8 @@ interface RawEdge {
   raw: string
   text: string
   line: number
+  col: number
   anchor?: string
-  /** wiki 语法没有路径，只能按标题找 */
-  wiki: boolean
   /** 图片不算文档引用 */
   image: boolean
 }
@@ -92,8 +92,6 @@ interface DocEntry {
   path: string
   name: string
   title: string
-  /** 归一化后的标题，只用于匹配 */
-  titleKey: string
   mtime: number
   size: number
   lines: number
@@ -113,18 +111,8 @@ const MAX_NEIGHBORS = 300
 const MD_LINK = /(!?)\[([^[\]]*)\]\(\s*<?([^()\s>]+)>?(?:\s+["'][^"']*["'])?\s*\)/g
 /** 只匹配普通链接，跳过图片 */
 const MD_LINK_PLAIN = /(?<!!)\[([^[\]]*)\]\(\s*<?([^()\s>]+)>?(?:\s+["'][^"']*["'])?\s*\)/g
-/** [[目标]] / [[目标|别名]] / [[目标#小节]] */
-const WIKI_LINK = /\[\[([^[\]|#]*)(?:#([^[\]|]+))?(?:\|([^[\]]+))?\]\]/g
 
 const stripInlineCode = (s: string) => s.replace(/`[^`]*`/g, (m) => ' '.repeat(m.length))
-
-const normTitle = (s: string) =>
-  s
-    .replace(/`[^`]*`/g, '')
-    .replace(/[*_~]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase()
 
 const posix = (p: string) => p.split(sep).join('/')
 const dirOf = (p: string) => {
@@ -208,23 +196,9 @@ export function parseDoc(path: string, content: string): { title: string; lines:
         raw: hash >= 0 ? href.slice(0, hash) : href,
         text: m[2].trim(),
         line: i + 1,
+        col: m.index + m[0].lastIndexOf(href),
         anchor: hash >= 0 ? href.slice(hash + 1) : undefined,
-        wiki: false,
         image: m[1] === '!'
-      })
-    }
-
-    WIKI_LINK.lastIndex = 0
-    while ((m = WIKI_LINK.exec(cleaned))) {
-      const target = (m[1] || '').trim()
-      if (!target) continue
-      raw.push({
-        raw: target,
-        text: (m[3] || target).trim(),
-        line: i + 1,
-        anchor: m[2]?.trim(),
-        wiki: true,
-        image: false
       })
     }
   }
@@ -242,10 +216,9 @@ export function parseDoc(path: string, content: string): { title: string; lines:
  * 原始 href 保持不动（模型改文档时要能对齐原文），只在后面加一个短的解析标记。
  */
 export function annotateLinks(content: string, edges: LinkEdge[]): string {
-  const mdEdges = edges.filter((e) => !e.wiki)
-  if (!mdEdges.length) return content
+  if (!edges.length) return content
   const byLine = new Map<number, LinkEdge[]>()
-  for (const e of mdEdges) {
+  for (const e of edges) {
     const list = byLine.get(e.line) || []
     list.push(e)
     byLine.set(e.line, list)
@@ -272,8 +245,6 @@ export class LinkIndex {
   private root = ''
   private docs = new Map<string, DocEntry>()
   private lower = new Map<string, string>()
-  private byName = new Map<string, string[]>()
-  private byTitle = new Map<string, string[]>()
   private inbound = new Map<string, InboundEdge[]>()
   private dirty = true
   private building: Promise<void> | null = null
@@ -289,8 +260,6 @@ export class LinkIndex {
     this.root = root
     this.docs.clear()
     this.lower.clear()
-    this.byName.clear()
-    this.byTitle.clear()
     this.inbound.clear()
     this.dirty = true
   }
@@ -384,7 +353,6 @@ export class LinkIndex {
             path: f.path,
             name: f.name,
             title: parsed.title,
-            titleKey: normTitle(parsed.title),
             mtime: f.mtime,
             size: f.size,
             lines: parsed.lines,
@@ -421,20 +389,8 @@ export class LinkIndex {
 
   private rebuildLookups() {
     this.lower.clear()
-    this.byName.clear()
-    this.byTitle.clear()
     for (const doc of this.docs.values()) {
       this.lower.set(doc.path.toLowerCase(), doc.path)
-      const nameKey = baseNoExt(doc.path).toLowerCase()
-      const nameList = this.byName.get(nameKey) || []
-      nameList.push(doc.path)
-      this.byName.set(nameKey, nameList)
-      const titleKey = doc.titleKey
-      if (titleKey) {
-        const titleList = this.byTitle.get(titleKey) || []
-        titleList.push(doc.path)
-        this.byTitle.set(titleKey, titleList)
-      }
     }
   }
 
@@ -449,8 +405,8 @@ export class LinkIndex {
           raw: r.raw,
           text: r.text,
           line: r.line,
+          col: r.col,
           anchor: r.anchor,
-          wiki: r.wiki,
           target: this.resolve(doc.path, r)
         }))
     }
@@ -463,6 +419,7 @@ export class LinkIndex {
           path: doc.path,
           title: doc.title,
           line: edge.line,
+          col: edge.col,
           text: edge.text,
           raw: edge.raw,
           summary: doc.summary
@@ -486,54 +443,24 @@ export class LinkIndex {
       if (p && this.docs.has(p) && !candidates.includes(p)) candidates.push(p)
     }
 
-    if (r.wiki) {
-      const key = normTitle(raw)
-      const byT = this.byTitle.get(key) || []
-      const byN = this.byName.get(key) || []
-      for (const p of byT) push(p)
-      for (const p of byN) push(p)
-    } else {
-      let href = raw
-      try {
-        href = decodeURI(href)
-      } catch {
-        /* 保留原样 */
-      }
-      href = href.replace(/^<|>$/g, '').trim()
-      if (!href) return { path: null, reason: 'self' }
-
-      const withExt = (p: string) => (MD_RE.test(p) ? p : `${p}.md`)
-      const baseDir = dirOf(from)
-
-      // 1. 相对当前文档的目录
-      const rel1 = normalizeRel(href.startsWith('/') ? href.slice(1) : `${baseDir}/${href}`)
-      push(this.pick(rel1))
-      push(this.pick(withExt(rel1)))
-
-      // 2. 当作库根相对
-      const rel2 = normalizeRel(href.replace(/^\//, ''))
-      push(this.pick(rel2))
-      push(this.pick(withExt(rel2)))
-
-      // 3. 只给文件名：唯一时直接用；多个同名且没有精确命中，判歧义
-      const nameKey = baseNoExt(href).toLowerCase()
-      const nameHits = this.byName.get(nameKey) || []
-      if (nameHits.length === 1) push(nameHits[0])
-      else if (nameHits.length > 1 && candidates.length === 0) {
-        for (const p of nameHits.slice(0, 5)) push(p)
-      }
-
-      // 4. 显示文字当标题。只在前三步都没命中时兜底：
-      //    否则「路径已经算对、只是显示文字恰好等于另一篇标题」的链接会被拖成歧义
-      const titleKey = normTitle(r.text)
-      if (titleKey && candidates.length === 0) {
-        const titleHits = this.byTitle.get(titleKey) || []
-        if (titleHits.length === 1) push(titleHits[0])
-        else if (titleHits.length > 1) {
-          for (const p of titleHits.slice(0, 5)) push(p)
-        }
-      }
+    // 严格按 Markdown 路径语义解析，只认「相对当前文档」和「/ 开头算库根」。
+    //
+    // 这里刻意不做任何回退。回退找出来的「命中」会掩盖作者写错的链接：
+    // [限流策略](限流策略.md) 在库里根本没有这个文件，靠显示文字猜标题猜到了
+    // 规则/限流阈值.md，界面显示正常，可链接本身是坏的。宁可报失效，也不猜。
+    let href = raw
+    try {
+      href = decodeURI(href)
+    } catch {
+      /* 保留原样 */
     }
+    href = href.replace(/^<|>$/g, '').trim()
+    if (!href) return { path: null, reason: 'self' }
+
+    const withExt = (p: string) => (MD_RE.test(p) ? p : `${p}.md`)
+    const rel = href.startsWith('/') ? normalizeRel(href.slice(1)) : normalizeRel(`${dirOf(from)}/${href}`)
+    push(this.pick(rel))
+    push(this.pick(withExt(rel)))
 
     if (candidates.length === 1) return { path: candidates[0], reason: 'ok' }
     if (candidates.length > 1) {
@@ -587,16 +514,24 @@ export class LinkIndex {
     return out.sort((a, b) => a.from.localeCompare(b.from, 'zh-Hans-CN') || a.line - b.line)
   }
 
-  /** 点击链接时用：把原始 href 解析成库内路径，失败返回 null */
   /**
-   * 解析单个链接。text 是链接的显示文字，参与「按标题兜底」这一步；
-   * 界面上点链接时传 `a.textContent`，不传则退化为拿文件名当标题线索。
-   * 必须和索引内部走同一套判定，否则会出现「人点不动、AI 却读得到」。
+   * 入链快照。移动/改名会先取一份，因为移动完成后旧路径就解析不到了，
+   * 那些边会立刻退化成 broken，再想回头找「谁引用过它」就没机会了。
+   */
+  async snapshotInbound(): Promise<Map<string, InboundEdge[]>> {
+    await this.sync()
+    const out = new Map<string, InboundEdge[]>()
+    for (const [to, list] of this.inbound) out.set(to, list.slice())
+    return out
+  }
+
+  /**
+   * 解析单个链接。和索引内部走同一套判定，否则会出现「人点不动、AI 却读得到」。
+   * 只认 Markdown 路径语义，找不到就是找不到，不回退到文件名或标题。
    */
   async resolveHref(
     from: string,
-    href: string,
-    text?: string
+    href: string
   ): Promise<{ path: string | null; anchor?: string; reason: LinkReason; candidates?: string[] }> {
     await this.sync()
     const key = this.canon(from) || from
@@ -608,8 +543,7 @@ export class LinkIndex {
       raw = raw.slice(0, hash)
     }
     if (!raw) return { path: key, anchor, reason: 'self' }
-    const hint = (text || '').trim() || baseNoExt(raw)
-    const target = this.resolve(key, { raw, text: hint, line: 0, wiki: false, image: false })
+    const target = this.resolve(key, { raw, text: '', line: 0, col: 0, image: false })
     return { path: target.path, anchor, reason: target.reason, candidates: target.candidates }
   }
 

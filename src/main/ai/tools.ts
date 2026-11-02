@@ -663,7 +663,7 @@ function renderLinksFull(g: DocLinks, withInbound: boolean): string {
           : e.target.reason === 'ambiguous'
             ? `有歧义：${(e.target.candidates || []).join(' / ')}`
             : '断链'
-      const full = e.wiki ? `[[${e.raw}]]` : e.raw
+      const full = e.raw
       lines.push(`· 第 ${e.line} 行 ${full} → ${where}`)
     }
     if (out.length > 40) lines.push(`· …另有 ${out.length - 40} 篇`)

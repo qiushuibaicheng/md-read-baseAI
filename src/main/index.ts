@@ -21,6 +21,8 @@ import * as fsp from 'fs/promises'
 import { pathToFileURL } from 'url'
 import { registerAi, shutdownAi } from './ai'
 import { LinkIndex } from './links'
+import type { InboundEdge } from './links'
+import { applyRelink } from './relink'
 
 // ---------------------------------------------------------------------------
 // 基础路径
@@ -370,6 +372,36 @@ function dropFromOrder(rel: string) {
   notifyConfig()
 }
 
+/**
+ * 移动/改名之后改写指向它的链接，并告诉界面改了多少处。
+ *
+ * snapshot 必须是移动前取的：移动一完成，旧路径就解析不到了，那些边会退化成断链，
+ * 再想回头查「谁引用过它」就没有依据了。
+ *
+ * 改写失败不让移动本身失败——文件已经挪好了，链接问题可以在设置页的失效清单里看到。
+ */
+async function relinkAfterMove(
+  snapshot: Map<string, InboundEdge[]>,
+  moves: Map<string, string>,
+  from: string
+): Promise<void> {
+  if (!moves.size) return
+  try {
+    const out = await applyRelink(config.vaultPath, snapshot, moves)
+    if (out.applied.length) {
+      win?.webContents.send('vault:relinked', {
+        from,
+        count: out.applied.length,
+        files: out.files,
+        skipped: out.skipped.length,
+        paths: [...new Set(out.applied.map((c) => c.path))]
+      })
+    }
+  } catch {
+    /* 静默跳过，不影响移动结果 */
+  }
+}
+
 async function moveDocTo(rel: string, targetDir: string): Promise<string> {
   const abs = safePath(rel)
   const destDir = targetDir ? safePath(targetDir) : config.vaultPath
@@ -377,8 +409,12 @@ async function moveDocTo(rel: string, targetDir: string): Promise<string> {
   const dest = join(destDir, basename(abs))
   if (resolve(dest) === resolve(abs)) return rel
   if (existsSync(dest)) throw new Error('目标文件夹里已有同名文件')
+  const snapshot = await linkIndex.snapshotInbound()
   await fsp.rename(abs, dest)
-  return relOf(dest)
+  const next = relOf(dest)
+  await relinkAfterMove(snapshot, new Map([[rel, next]]), rel)
+  linkIndex.invalidate()
+  return next
 }
 
 async function moveFolderTo(rel: string, targetDir: string): Promise<string> {
@@ -389,8 +425,17 @@ async function moveFolderTo(rel: string, targetDir: string): Promise<string> {
   const dest = join(destDir, name)
   if (resolve(dest) === resolve(abs)) return rel
   if (existsSync(dest)) throw new Error(`目标位置已有同名文件夹「${name}」`)
+  // 快照与内部文档清单都得在被挪走之前拿：挪完旧路径就查不到了
+  const snapshot = await linkIndex.snapshotInbound()
+  const inner = (await linkIndex.list())
+    .map((d) => d.path)
+    .filter((p) => p.startsWith(`${rel}/`))
   await fsp.rename(abs, dest)
   const next = relOf(dest)
+  const moves = new Map<string, string>()
+  for (const p of inner) moves.set(p, next + p.slice(rel.length))
+  await relinkAfterMove(snapshot, moves, rel)
+  linkIndex.invalidate()
   remapOpenPaths(rel, next)
   remapOrder(rel, next)
   notifyConfig()
@@ -812,8 +857,11 @@ function setupIPC() {
     const abs = safePath(rel)
     const clean = nextName.replace(/[\\/:*?"<>|]/g, '').trim() || '未命名'
     const nextAbs = join(dirname(abs), clean.endsWith('.md') ? clean : `${clean}.md`)
+    const snapshot = await linkIndex.snapshotInbound()
     await fsp.rename(abs, nextAbs)
     const next = relative(config.vaultPath, nextAbs).split('\\').join('/')
+    await relinkAfterMove(snapshot, new Map([[rel, next]]), rel)
+    linkIndex.invalidate()
     remapOrder(rel, next)
     remapOpenPaths(rel, next)
     saveConfig()
@@ -979,8 +1027,8 @@ function setupIPC() {
   ipcMain.handle('links:broken', async () => linkIndex.broken())
   ipcMain.handle('links:stats', async () => linkIndex.statsNow())
   ipcMain.handle('links:graph', async (_e, rel: string, depth = 1) => linkIndex.neighborhood(rel, depth))
-  ipcMain.handle('links:resolve', async (_e, from: string, href: string, text?: string) =>
-    linkIndex.resolveHref(from, href, text)
+  ipcMain.handle('links:resolve', async (_e, from: string, href: string) =>
+    linkIndex.resolveHref(from, href)
   )
   ipcMain.handle('links:index', async () => {
     await linkIndex.sync(true)
