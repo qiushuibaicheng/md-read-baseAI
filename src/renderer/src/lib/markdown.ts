@@ -127,13 +127,27 @@ md.renderer.rules.image = (tokens, idx, options, env, self) => {
   return self.renderToken(tokens, idx, options)
 }
 
-// 外链
+// 外链走系统浏览器；库内文档链接交给渲染层解析（路径相对谁，只有主进程的索引知道）
 const defaultLinkOpen = md.renderer.rules.link_open
 md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
   const href = tokens[idx].attrGet('href') || ''
   if (/^https?:/i.test(href)) {
     tokens[idx].attrSet('target', '_blank')
     tokens[idx].attrSet('rel', 'noreferrer noopener')
+  } else if (href && !/^(#|mailto:|tel:|javascript:|data:)/i.test(href)) {
+    const cut = href.indexOf('#')
+    const raw = cut >= 0 ? href.slice(0, cut) : href
+    const anchor = cut >= 0 ? href.slice(cut + 1) : ''
+    if (raw) {
+      tokens[idx].attrSet('data-doc-link', raw)
+      if (anchor) tokens[idx].attrSet('data-doc-anchor', anchor)
+      // 去掉 href：Electron 里相对路径导航会被 will-navigate 拦下，而且没必要
+      const attrs = tokens[idx].attrs
+      if (attrs) {
+        const at = attrs.findIndex((pair) => pair[0] === 'href')
+        if (at >= 0) attrs.splice(at, 1)
+      }
+    }
   }
   if (defaultLinkOpen) return defaultLinkOpen(tokens, idx, options, env, self)
   return self.renderToken(tokens, idx, options)

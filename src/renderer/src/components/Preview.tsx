@@ -9,9 +9,20 @@ interface Props {
   onCopy: (text: string, label?: string) => void
   onToggleTask: (line: number) => void
   onSelectText: (text: string, rect: { x: number; y: number }) => void
+  /** 点击库内文档链接 */
+  onDocLink?: (raw: string, anchor?: string) => void
 }
 
-export default function Preview({ html, fontSize, docKey, theme, onCopy, onToggleTask, onSelectText }: Props) {
+export default function Preview({
+  html,
+  fontSize,
+  docKey,
+  theme,
+  onCopy,
+  onToggleTask,
+  onSelectText,
+  onDocLink
+}: Props) {
   const scroller = useRef<HTMLDivElement | null>(null)
   const bar = useRef<HTMLDivElement | null>(null)
   const lastTheme = useRef(theme)
@@ -69,6 +80,12 @@ export default function Preview({ html, fontSize, docKey, theme, onCopy, onToggl
 
     const anchor = target.closest('a') as HTMLAnchorElement | null
     if (anchor) {
+      const docLink = anchor.getAttribute('data-doc-link')
+      if (docLink) {
+        e.preventDefault()
+        onDocLink?.(docLink, anchor.getAttribute('data-doc-anchor') || undefined)
+        return
+      }
       const href = anchor.getAttribute('href') || ''
       if (href.startsWith('#')) {
         e.preventDefault()

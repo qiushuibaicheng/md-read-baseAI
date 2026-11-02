@@ -114,6 +114,53 @@ export interface DocMeta {
   size: number
 }
 
+export type LinkReason = 'ok' | 'broken' | 'ambiguous' | 'external' | 'self'
+
+export interface LinkEdge {
+  from: string
+  raw: string
+  text: string
+  line: number
+  anchor?: string
+  wiki: boolean
+  target: { path: string | null; reason: LinkReason; candidates?: string[] }
+  toSummary?: string
+}
+
+export interface InboundEdge {
+  path: string
+  title: string
+  line: number
+  text: string
+  raw: string
+  summary: string
+}
+
+export interface DocLinks {
+  path: string
+  title: string
+  lines: number
+  out: LinkEdge[]
+  inbound: InboundEdge[]
+  broken: LinkEdge[]
+}
+
+export interface BrokenLink {
+  from: string
+  fromTitle: string
+  raw: string
+  text: string
+  line: number
+}
+
+export interface LinkStats {
+  docs: number
+  edges: number
+  broken: number
+  ambiguous: number
+  ms: number
+}
+
 export interface Snippet {
   id: string
   title: string

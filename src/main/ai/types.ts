@@ -2,6 +2,10 @@
 // AI 内核共享类型
 // ---------------------------------------------------------------------------
 
+import type { BrokenLink, DocLinks } from '../links'
+
+export type { BrokenLink, DocLinks }
+
 export interface ModelProfile {
   id: string
   name: string
@@ -103,6 +107,16 @@ export interface VaultAccess {
   snippets(): { id: string; title: string; content: string }[]
   saveSnippet(title: string, content: string): { id: string; title: string; content: string }
   clips(): { text: string; time: number }[]
+  /** 某篇文档的出入链；文档不存在返回 null */
+  links(rel: string): Promise<DocLinks | null>
+  /** N 跳邻域，只给标题与摘要，不给全文 */
+  neighborhood(rel: string, depth: number): Promise<
+    { path: string; title: string; summary: string; hop: number; dir: 'out' | 'in' }[]
+  >
+  /** 两篇之间的最短引用路径，找不到返回 null */
+  linkPath(from: string, to: string): Promise<string[] | null>
+  /** 全库断链 / 歧义链接 */
+  brokenLinks(): Promise<BrokenLink[]>
 }
 
 export interface WriteProposal {

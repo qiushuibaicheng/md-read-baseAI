@@ -31,6 +31,14 @@ const api = {
   openDocExternal: (rel: string) => ipcRenderer.invoke('doc:openExternal', rel),
 
   search: (q: string) => ipcRenderer.invoke('search', q),
+
+  linksOf: (rel: string) => ipcRenderer.invoke('links:of', rel),
+  linksBroken: () => ipcRenderer.invoke('links:broken'),
+  linksStats: () => ipcRenderer.invoke('links:stats'),
+  linksGraph: (rel: string, depth = 1) => ipcRenderer.invoke('links:graph', rel, depth),
+  linksResolve: (from: string, href: string) => ipcRenderer.invoke('links:resolve', from, href),
+  linksReindex: () => ipcRenderer.invoke('links:index'),
+  onLinksChanged: (cb: () => void) => on('links:changed', cb),
   saveSnippets: (list: unknown) => ipcRenderer.invoke('snippets:save', list),
 
   copyText: (text: string) => ipcRenderer.invoke('clipboard:write', text),

@@ -1,4 +1,5 @@
-import type { AskRequest, PlanStep, SkillDef, ToolCtx, ToolSpec, WriteProposal } from './types'
+import { annotateLinks } from '../links'
+import type { AskRequest, DocLinks, PlanStep, SkillDef, ToolCtx, ToolSpec, WriteProposal } from './types'
 
 // ---------------------------------------------------------------------------
 // 工具声明
@@ -34,6 +35,33 @@ export const BUILTIN_TOOLS: ToolSpec[] = [
       end: { type: 'number', description: '可选，结束行（含）' }
     },
     ['path']
+  ),
+  fn(
+    'get_links',
+    '查看某篇文档的链接关系：它引用了谁、被谁引用、哪些链接失效（含行号与对方摘要）。判断「改这篇会影响哪些文档」时用，比逐个读文档省得多。',
+    {
+      path: { type: 'string', description: '文档相对路径' },
+      inbound: { type: 'boolean', description: '是否列出被哪些文档引用，默认 true' }
+    },
+    ['path']
+  ),
+  fn(
+    'expand_doc',
+    '围绕一篇文档展开引用邻域，返回每篇的标题与一句话摘要（不是全文）。想快速摸清一簇相关文档、或判断该深入读哪篇时用。',
+    {
+      path: { type: 'string', description: '文档相对路径' },
+      depth: { type: 'number', description: '展开层数，1 或 2，默认 1' }
+    },
+    ['path']
+  ),
+  fn(
+    'find_link_path',
+    '找两篇文档之间的引用链，返回中间的跳转路径。回答「这两篇有什么关系」「这篇为什么会提到那个结论」时用。',
+    {
+      from: { type: 'string', description: '起点文档相对路径' },
+      to: { type: 'string', description: '终点文档相对路径' }
+    },
+    ['from', 'to']
   ),
   fn(
     'search_docs',
@@ -280,23 +308,66 @@ export async function execTool(name: string, rawArgs: string, ctx: ToolCtx): Pro
         .map((d) => `- ${d.path}（${d.size} 字符）`)
         .join('\n')}`
     }
+    if (name === 'get_links') {
+      const p = normPath(args.path)
+      if (!p) return '缺少 path 参数'
+      const g = await ctx.vault.links(p)
+      if (!g) return `库里没有《${p}》。先用 list_tree 或 search_docs 确认准确路径。`
+      return renderLinksFull(g, args.inbound !== false)
+    }
+    if (name === 'expand_doc') {
+      const p = normPath(args.path)
+      if (!p) return '缺少 path 参数'
+      const depth = Math.max(1, Math.min(Number(args.depth) || 1, 2))
+      const list = await ctx.vault.neighborhood(p, depth)
+      if (!list.length) return `《${p}》在 ${depth} 跳范围内没有引用关系。`
+      const groups: string[] = []
+      for (let hop = 1; hop <= depth; hop++) {
+        const layer = list.filter((n) => n.hop === hop)
+        if (!layer.length) continue
+        groups.push(`第 ${hop} 跳（共 ${layer.length} 篇${layer.length > 20 ? '，只列前 20' : ''}）：`)
+        for (const n of layer.slice(0, 20)) {
+          groups.push(`· ${n.path}${n.dir === 'in' ? '（引用了本文）' : ''} — ${n.summary}`)
+        }
+        if (layer.length > 20) groups.push(`· …另有 ${layer.length - 20} 篇`)
+        if (layer.length > 100) {
+          groups.push('（这一层被枢纽文档撑开了，逐篇读没有意义。要定位具体关系请用 get_links 看引用位置）')
+        }
+      }
+      if (list.length >= 300) groups.push('（结果已截断到 300 篇）')
+      groups.push('这里只有摘要。确定要哪一篇的细节时再 read_doc。')
+      return groups.join('\n')
+    }
+    if (name === 'find_link_path') {
+      const from = normPath(args.from)
+      const to = normPath(args.to)
+      if (!from || !to) return '缺少 from 或 to 参数'
+      const chain = await ctx.vault.linkPath(from, to)
+      if (!chain) return `《${from}》和《${to}》在 5 跳内没有引用关系（也可能其中一篇路径不对）。`
+      if (chain.length === 1) return '是同一篇文档。'
+      return `${chain.length - 1} 步引用链：\n${chain.join('\n  → ')}`
+    }
     if (name === 'read_doc') {
       const p = normPath(args.path)
       if (!p) return '缺少 path 参数'
       const text = await vault.read(p)
       const lines = text.split('\n')
+      // 链接就地标注：模型不用自己算相对路径，也不用猜「这个文件在不在」
+      const graph = await ctx.vault.links(p).catch(() => null)
+      const annotated = graph ? annotateLinks(text, graph.out) : text
+      const body = annotated.split('\n')
       const start = Number(args.start)
       const end = Number(args.end)
       if (Number.isFinite(start) && start > 0) {
         const from = Math.max(1, Math.trunc(start))
-        const to = Number.isFinite(end) && end >= from ? Math.min(Math.trunc(end), lines.length) : lines.length
-        const body = lines.slice(from - 1, to).join('\n')
-        return `（第 ${from}-${to} 行，共 ${lines.length} 行）\n${cap(body, 14000)}`
+        const to = Number.isFinite(end) && end >= from ? Math.min(Math.trunc(end), body.length) : body.length
+        return `（第 ${from}-${to} 行，共 ${lines.length} 行）\n${cap(body.slice(from - 1, to).join('\n'), 14000)}`
       }
-      if (text.length > 16000) {
-        return `${cap(text, 16000)}\n\n…（全文共 ${text.length} 字符 / ${lines.length} 行，已给出开头；需要后面的内容请用 read_doc 带 start/end 按行读）`
-      }
-      return text
+      const head =
+        annotated.length > 16000
+          ? `${cap(annotated, 16000)}\n\n…（全文共 ${text.length} 字符 / ${lines.length} 行，已给出开头；需要后面的内容请用 read_doc 带 start/end 按行读）`
+          : annotated
+      return graph ? `${head}\n\n${renderLinkGraph(graph)}` : head
     }
     if (name === 'search_docs') {
       const q = String(args.query || '').trim()
@@ -533,6 +604,86 @@ export async function execTool(name: string, rawArgs: string, ctx: ToolCtx): Pro
 // 辅助
 // ---------------------------------------------------------------------------
 const cap = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}\n…（已截断）` : s)
+
+const MAX_GRAPH_ROWS = 12
+
+/**
+ * 读文档时顺带给出的链接图谱。
+ * 只给路径与摘要，不给正文 —— 目的是让模型知道"该不该去读"，而不是替它读。
+ */
+function renderLinkGraph(g: DocLinks): string {
+  const out = g.out.filter((e) => e.target.path)
+  const bad = g.out.filter((e) => !e.target.path && e.target.reason !== 'external' && e.target.reason !== 'self')
+  const lines = ['〔链接图谱〕（来自库内索引，无需再逐个 read_doc 试探）']
+
+  if (out.length) {
+    lines.push(`本文引用 ${out.length} 篇：`)
+    for (const e of out.slice(0, MAX_GRAPH_ROWS)) {
+      const summary = e.toSummary ? ` — ${e.toSummary}` : ''
+      lines.push(`· ${e.target.path}（第 ${e.line} 行${e.anchor ? `，锚点 ${e.anchor}` : ''}）${summary}`)
+    }
+    if (out.length > MAX_GRAPH_ROWS) lines.push(`· …另有 ${out.length - MAX_GRAPH_ROWS} 篇，用 get_links 看全量`)
+  } else {
+    lines.push('本文没有引用其他文档。')
+  }
+
+  if (g.inbound.length) {
+    lines.push(`被 ${g.inbound.length} 篇引用：`)
+    for (const e of g.inbound.slice(0, MAX_GRAPH_ROWS)) {
+      lines.push(`· ${e.path}（第 ${e.line} 行） — ${e.summary}`)
+    }
+    if (g.inbound.length > MAX_GRAPH_ROWS) lines.push(`· …另有 ${g.inbound.length - MAX_GRAPH_ROWS} 篇，用 get_links 看全量`)
+  }
+
+  if (bad.length) {
+    lines.push(`失效链接 ${bad.length} 处：`)
+    for (const e of bad.slice(0, 6)) {
+      const why =
+        e.target.reason === 'ambiguous'
+          ? `有多个候选：${(e.target.candidates || []).join(' / ')}，需要向用户确认`
+          : '库内没有这个文件'
+      lines.push(`· 第 ${e.line} 行 ${e.raw} — ${why}`)
+    }
+  }
+
+  lines.push('需要正文时再单独 read_doc 某一篇；不要把上面列出的全部读进上下文。')
+  return lines.join('\n')
+}
+
+/** get_links 用：全量出入链，带断链判定 */
+function renderLinksFull(g: DocLinks, withInbound: boolean): string {
+  const lines = [`《${g.title}》${g.path}（${g.lines} 行）`]
+  const out = g.out.filter((e) => e.target.reason !== 'external')
+  if (out.length) {
+    lines.push(`引用 ${out.length} 篇：`)
+    for (const e of out.slice(0, 40)) {
+      const where =
+        e.target.reason === 'ok'
+          ? e.target.path
+          : e.target.reason === 'ambiguous'
+            ? `有歧义：${(e.target.candidates || []).join(' / ')}`
+            : '断链'
+      const full = e.wiki ? `[[${e.raw}]]` : e.raw
+      lines.push(`· 第 ${e.line} 行 ${full} → ${where}`)
+    }
+    if (out.length > 40) lines.push(`· …另有 ${out.length - 40} 篇`)
+  } else {
+    lines.push('没有引用其他文档。')
+  }
+
+  if (withInbound) {
+    if (g.inbound.length) {
+      lines.push(`被 ${g.inbound.length} 篇引用：`)
+      for (const e of g.inbound.slice(0, 40)) {
+        lines.push(`· ${e.path}（第 ${e.line} 行）— ${e.summary}`)
+      }
+      if (g.inbound.length > 40) lines.push(`· …另有 ${g.inbound.length - 40} 篇`)
+    } else {
+      lines.push('没有被其他文档引用。')
+    }
+  }
+  return lines.join('\n')
+}
 
 /** 目录树：一次给到层级，省掉模型来回 list 的次数 */
 async function renderTree(ctx: ToolCtx, root: string, depth: number): Promise<string> {

@@ -4,6 +4,7 @@ import Sidebar from './components/Sidebar'
 import SearchPalette from './components/SearchPalette'
 import SettingsDialog from './components/SettingsDialog'
 import Preview from './components/Preview'
+import Backlinks from './components/Backlinks'
 import AiPanel, { type AiPanelHandle } from './components/AiPanel'
 import ModelsDialog from './components/ModelsDialog'
 import DiffDialog from './components/DiffDialog'
@@ -12,6 +13,7 @@ import { renderMarkdown, exportStyles, relativeTime } from './lib/markdown'
 import type {
   AppConfig,
   ClipItem,
+  DocLinks,
   DocMeta,
   ModelProfile,
   SearchResult,
@@ -293,6 +295,54 @@ export default function App() {
     saveTimers.current[active] = setTimeout(() => flushSave(active), 600)
   }
 
+  // ---------------------------------------------------------------- 链接图
+  const [links, setLinks] = useState<DocLinks | null>(null)
+
+  useEffect(() => {
+    if (!active) {
+      setLinks(null)
+      return
+    }
+    let alive = true
+    window.api
+      .linksOf(active)
+      .then((d) => {
+        if (alive) setLinks(d)
+      })
+      .catch(() => undefined)
+    return () => {
+      alive = false
+    }
+  }, [active, docs])
+
+  // 索引重建（外部改动、AI 写入）后刷新当前文档的关系
+  useEffect(
+    () =>
+      window.api.onLinksChanged(() => {
+        if (!active) return
+        window.api
+          .linksOf(active)
+          .then(setLinks)
+          .catch(() => undefined)
+      }),
+    [active]
+  )
+
+  /** 滚动到锚点：先按 id，再按标题文字 */
+  const scrollToAnchor = useCallback((key: string) => {
+    const box = document.querySelector('.preview.markdown-body')
+    if (!box) return
+    const byId = box.querySelector(`#${CSS.escape(key)}`) as HTMLElement | null
+    const hit =
+      byId ||
+      ([...box.querySelectorAll('h1,h2,h3,h4,h5,h6')].find(
+        (h) => (h.textContent || '').trim() === key
+      ) as HTMLElement | undefined)
+    hit?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [])
+
+  /** 点预览里的库内链接：交给主进程解析，再跳过去 */
+
   // ---------------------------------------------------------------- 文档操作
   const openDoc = (path: string) => {
     setTabs((t) => (t.includes(path) ? t : [...t, path].slice(-9)))
@@ -301,6 +351,35 @@ export default function App() {
     setSelection(null)
     setOutlineId(null)
   }
+
+  const showToast = useCallback((msg: string, bad = false) => {
+    setToast({ id: Date.now(), msg, bad })
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+    toastTimer.current = setTimeout(() => setToast(null), bad ? 2600 : 1700)
+  }, [])
+
+  /** 点预览里的库内链接：交给主进程解析，再跳过去 */
+  const handleDocLink = useCallback(
+    async (raw: string, anchor?: string) => {
+      if (!active) return
+      try {
+        const res = await window.api.linksResolve(active, raw)
+        if (!res.path) {
+          showToast(
+            res.reason === 'ambiguous' ? `「${raw}」有多个同名目标，先确认路径` : `库里找不到「${raw}」`,
+            true
+          )
+          return
+        }
+        openDoc(res.path)
+        const target = res.anchor || anchor
+        if (target) setTimeout(() => scrollToAnchor(target), 260)
+      } catch {
+        showToast(`打不开「${raw}」`, true)
+      }
+    },
+    [active, scrollToAnchor, showToast]
+  )
 
   const closeTab = (path: string, e?: React.MouseEvent) => {
     e?.stopPropagation()
@@ -462,12 +541,6 @@ export default function App() {
   }
 
   // ---------------------------------------------------------------- 片段 / 剪贴板
-  const showToast = useCallback((msg: string, bad = false) => {
-    setToast({ id: Date.now(), msg, bad })
-    if (toastTimer.current) clearTimeout(toastTimer.current)
-    toastTimer.current = setTimeout(() => setToast(null), bad ? 2600 : 1700)
-  }, [])
-
   const copy = useCallback(
     async (text: string, label = '已复制') => {
       await window.api.copyText(text)
@@ -1289,9 +1362,14 @@ export default function App() {
                     onCopy={copy}
                     onToggleTask={toggleTask}
                     onSelectText={(text, rect) => setSelection({ text, ...rect })}
+                    onDocLink={handleDocLink}
                   />
                 )}
               </div>
+
+              {(mode === 'preview' || mode === 'split') && links && (
+                <Backlinks links={links} onOpen={(p) => openDoc(p)} />
+              )}
             </>
           )}
         </main>

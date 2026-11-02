@@ -20,6 +20,7 @@ import type { Dirent } from 'fs'
 import * as fsp from 'fs/promises'
 import { pathToFileURL } from 'url'
 import { registerAi, shutdownAi } from './ai'
+import { LinkIndex } from './links'
 
 // ---------------------------------------------------------------------------
 // 基础路径
@@ -200,42 +201,18 @@ interface DocMeta {
 
 const IGNORED = new Set(['node_modules', '.git', '.obsidian', '.trash', '.DS_Store', 'assets'])
 
-async function scanVault(dir = config.vaultPath): Promise<DocMeta[]> {
-  const out: DocMeta[] = []
-  async function walk(current: string, depth: number) {
-    if (depth > 6) return
-    let entries: any[] = []
-    try {
-      entries = await fsp.readdir(current, { withFileTypes: true })
-    } catch {
-      return
-    }
-    for (const entry of entries) {
-      if (entry.name.startsWith('.') || IGNORED.has(entry.name)) continue
-      const abs = join(current, entry.name)
-      if (entry.isDirectory()) {
-        await walk(abs, depth + 1)
-      } else if (/\.(md|markdown|mdx|txt)$/i.test(entry.name)) {
-        try {
-          const st = await fsp.stat(abs)
-          const raw = await fsp.readFile(abs, 'utf-8')
-          const heading = raw.match(/^#\s+(.+)$/m)
-          out.push({
-            path: relative(config.vaultPath, abs).split('\\').join('/'),
-            name: entry.name,
-            title: (heading ? heading[1] : entry.name.replace(/\.(md|markdown|mdx|txt)$/i, '')).trim(),
-            mtime: st.mtimeMs,
-            size: st.size
-          })
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-  }
-  await walk(dir, 0)
-  out.sort((a, b) => b.mtime - a.mtime)
-  return out
+/**
+ * 全库索引。文档标题、大小、行数、链接图都在这里，
+ * 目录扫描只做 stat，内容只在 mtime/size 变化时重读。
+ */
+const linkIndex = new LinkIndex()
+
+async function scanVault(): Promise<DocMeta[]> {
+  await linkIndex.sync()
+  const list = await linkIndex.list()
+  return list
+    .map((d) => ({ path: d.path, name: d.name, title: d.title, mtime: d.mtime, size: d.size }))
+    .sort((a, b) => b.mtime - a.mtime)
 }
 
 /** 扫描全部子目录（含空目录），返回相对路径，例如 ["排查", "排查/502"] */
@@ -486,6 +463,8 @@ async function moveEntryAny(from: string, toDir: string, newName?: string): Prom
   }
   saveConfig()
   notifyConfig()
+  // 移动/改名会改变相对链接的基准，整个图都得重算
+  linkIndex.invalidate()
   win?.webContents.send('vault:changed', await scanVault())
   return next
 }
@@ -793,9 +772,11 @@ function setupIPC() {
     config.vaultPath = res.filePaths[0]
     config.lastDoc = null
     config.openTabs = []
+    config.order = {}
     ensureDir(config.vaultPath)
     seedVault()
     saveConfig()
+    linkIndex.setRoot(config.vaultPath)
     startVaultWatch()
     return { config, docs: await scanVault() }
   })
@@ -992,6 +973,17 @@ function setupIPC() {
   ipcMain.handle('app:openVault', () => shell.openPath(config.vaultPath))
   ipcMain.handle('app:isPackaged', () => app.isPackaged)
   ipcMain.handle('vault:path', () => config.vaultPath)
+
+  // ---------------------------------------------------------------- 链接图
+  ipcMain.handle('links:of', async (_e, rel: string) => linkIndex.doc(rel))
+  ipcMain.handle('links:broken', async () => linkIndex.broken())
+  ipcMain.handle('links:stats', async () => linkIndex.statsNow())
+  ipcMain.handle('links:graph', async (_e, rel: string, depth = 1) => linkIndex.neighborhood(rel, depth))
+  ipcMain.handle('links:resolve', async (_e, from: string, href: string) => linkIndex.resolveHref(from, href))
+  ipcMain.handle('links:index', async () => {
+    await linkIndex.sync(true)
+    return linkIndex.statsNow()
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,8 +997,10 @@ function startVaultWatch() {
     watcher = watch(config.vaultPath, { recursive: true }, () => {
       if (watchTimer) clearTimeout(watchTimer)
       watchTimer = setTimeout(async () => {
+        linkIndex.invalidate()
         if (!win) return
         win.webContents.send('vault:changed', await scanVault())
+        win.webContents.send('links:changed')
       }, 600)
     })
   } catch {
@@ -1025,6 +1019,9 @@ if (!gotLock) {
 
   app.whenReady().then(async () => {
     seedVault()
+    linkIndex.setRoot(config.vaultPath)
+    // 后台先把索引建起来，别等第一次对话才付这份时间
+    linkIndex.sync(true).catch(() => undefined)
     protocol.handle('ink-asset', (request) => {
       const url = new URL(request.url)
       const target = url.searchParams.get('p')
@@ -1050,6 +1047,7 @@ if (!gotLock) {
         const abs = safePath(rel)
         await fsp.mkdir(dirname(abs), { recursive: true })
         await fsp.writeFile(abs, content, 'utf-8')
+        linkIndex.invalidate(rel)
       },
       create: async (title: string, content: string, dir?: string) => {
         const dirAbs = dir ? safePath(dir) : config.vaultPath
@@ -1060,6 +1058,7 @@ if (!gotLock) {
         await fsp.writeFile(abs, content.endsWith('\n') ? content : `${content}\n`, 'utf-8')
         const rel = relative(config.vaultPath, abs).split('\\').join('/')
         unshiftOrder(dir || '', rel)
+        linkIndex.invalidate()
         win?.webContents.send('vault:changed', await scanVault())
         return rel
       },
@@ -1084,6 +1083,7 @@ if (!gotLock) {
         const abs = safePath(rel)
         await shell.trashItem(abs)
         dropFromOrder(rel)
+        linkIndex.invalidate()
         win?.webContents.send('vault:changed', await scanVault())
       },
       outline: async (rel: string) => outlineOf(await fsp.readFile(safePath(rel), 'utf-8')),
@@ -1101,7 +1101,11 @@ if (!gotLock) {
         win?.webContents.send('snippets:changed', next)
         return item
       },
-      clips: () => clipHistory.map((c) => ({ text: c.text, time: c.time }))
+      clips: () => clipHistory.map((c) => ({ text: c.text, time: c.time })),
+      links: (rel: string) => linkIndex.doc(rel),
+      neighborhood: (rel: string, depth: number) => linkIndex.neighborhood(rel, depth),
+      linkPath: (from: string, to: string) => linkIndex.pathBetween(from, to),
+      brokenLinks: () => linkIndex.broken()
     }))
     createWindow()
     createTray()

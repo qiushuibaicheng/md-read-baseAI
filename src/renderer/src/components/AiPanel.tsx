@@ -1,7 +1,7 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import MessageBody from './MessageBody'
 import { Icon } from './Icons'
-import { SKILLS, buildSystemPrompt, estimateTokens, packContextFiles, unwrapFence } from '../lib/ai'
+import { SKILLS, buildSystemPrompt, estimateTokens, formatLinkGraph, packContextFiles, unwrapFence } from '../lib/ai'
 import type { AiSession, AiSessionMessage, DocMeta, ModelProfile, PlanStep, SkillDef, WriteProposal } from '../lib/types'
 
 const BUDGET_STEPS = [8000, 16000, 32000, 64000, 128000]
@@ -424,6 +424,8 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
           caret && docPath && caret.path === docPath && caret.start >= 0
             ? `用户光标在《${docTitle || '当前文档'}》第 ${caret.start + 1} 个字符处。`
             : ''
+        // 索引里现成的出入链，直接带给模型，省掉它自己试探路径的几轮
+        const graph = docPath ? await window.api.linksOf(docPath).catch(() => null) : null
         const system = buildSystemPrompt({
           selection: attachSelection && selection ? selection : '',
           contextFiles: packed,
@@ -433,6 +435,7 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
               ? docList.map((d) => ({ path: d.path, title: d.title, size: d.size }))
               : undefined,
           skills: skillText,
+          linkGraph: graph ? formatLinkGraph(graph) : undefined,
           extra: cursorHint || undefined
         })
 

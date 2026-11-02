@@ -172,6 +172,56 @@ export function packContextFiles(files: ContextFile[], budgetTokens: number): Pa
   }))
 }
 
+/** 把索引里的链接关系压成一段给模型看的文字，只留路径与摘要 */
+export function formatLinkGraph(g: {
+  path: string
+  title: string
+  out: {
+    raw: string
+    line: number
+    wiki: boolean
+    toSummary?: string
+    target: { path: string | null; reason: string; candidates?: string[] }
+  }[]
+  inbound: { path: string; line: number; summary: string }[]
+}): string {
+  const LIMIT = 20
+  const lines = [`当前文档：${g.path}`]
+  const ok = g.out.filter((e) => e.target.path)
+
+  if (ok.length) {
+    lines.push(`它引用了 ${ok.length} 篇：`)
+    for (const e of ok.slice(0, LIMIT)) {
+      const summary = e.toSummary ? ` — ${e.toSummary}` : ''
+      lines.push(`· ${e.target.path}（第 ${e.line} 行）${summary}`)
+    }
+    if (ok.length > LIMIT) lines.push(`· …另有 ${ok.length - LIMIT} 篇，用 get_links 查看`)
+  }
+
+  if (g.inbound.length) {
+    lines.push(`它被 ${g.inbound.length} 篇引用：`)
+    for (const e of g.inbound.slice(0, LIMIT)) {
+      lines.push(`· ${e.path}（第 ${e.line} 行） — ${e.summary}`)
+    }
+    if (g.inbound.length > LIMIT) lines.push(`· …另有 ${g.inbound.length - LIMIT} 篇，用 get_links 查看`)
+  }
+
+  const bad = g.out.filter((e) => !e.target.path && (e.target.reason === 'broken' || e.target.reason === 'ambiguous'))
+  if (bad.length) {
+    lines.push(`失效链接 ${bad.length} 处：`)
+    for (const e of bad.slice(0, 6)) {
+      lines.push(
+        `· 第 ${e.line} 行 ${e.raw} — ${
+          e.target.reason === 'ambiguous' ? `多个候选：${(e.target.candidates || []).join(' / ')}` : '库内没有这个文件'
+        }`
+      )
+    }
+  }
+
+  if (lines.length === 1) lines.push('这篇文档没有任何引用关系。')
+  return lines.join('\n')
+}
+
 export function buildSystemPrompt(opts: {
   docTitle?: string
   docContent?: string
@@ -179,6 +229,8 @@ export function buildSystemPrompt(opts: {
   contextFiles?: PackedFile[]
   library?: { path: string; title: string; size: number }[]
   skills?: string
+  /** 当前文档的出入链摘要，来自库内索引 */
+  linkGraph?: string
   extra?: string
 }): string {
   const parts = [BASE_INSTRUCTIONS]
@@ -199,6 +251,12 @@ export function buildSystemPrompt(opts: {
     const body = (opts.docContent || '').slice(0, 24000)
     parts.push(
       `## 当前打开的文档\n标题：${opts.docTitle || '未命名'}\n\n<document>\n${body}\n</document>`
+    )
+  }
+
+  if (opts.linkGraph) {
+    parts.push(
+      `## 当前文档的引用关系\n这是库内索引算好的结果，可以直接用，不需要再自己试探路径。要展开某一篇时用 read_doc，要判断影响范围时用 get_links。\n\n<link-graph>\n${opts.linkGraph}\n</link-graph>`
     )
   }
 

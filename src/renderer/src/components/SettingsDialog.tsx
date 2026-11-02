@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Icon } from './Icons'
-import type { AppConfig, McpStatus, ModelProfile, SkillDef } from '../lib/types'
+import type { AppConfig, BrokenLink, LinkStats, McpStatus, ModelProfile, SkillDef } from '../lib/types'
 
 interface Props {
   open: boolean
@@ -66,6 +66,32 @@ export default function SettingsDialog({
   const [mcpStatus, setMcpStatus] = useState<McpStatus[]>([])
   const [mcpErr, setMcpErr] = useState('')
   const [mcpBusy, setMcpBusy] = useState(false)
+  const [linkStats, setLinkStats] = useState<LinkStats | null>(null)
+  const [brokenList, setBrokenList] = useState<BrokenLink[] | null>(null)
+  const [linkBusy, setLinkBusy] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    window.api.linksStats().then(setLinkStats).catch(() => undefined)
+  }, [open])
+
+  const reindexLinks = async () => {
+    setLinkBusy(true)
+    try {
+      setLinkStats(await window.api.linksReindex())
+      if (brokenList) setBrokenList(await window.api.linksBroken())
+    } finally {
+      setLinkBusy(false)
+    }
+  }
+
+  const toggleBroken = async () => {
+    if (brokenList) {
+      setBrokenList(null)
+      return
+    }
+    setBrokenList(await window.api.linksBroken())
+  }
 
   useEffect(() => {
     if (!open) return
@@ -293,6 +319,54 @@ export default function SettingsDialog({
                   更换
                 </button>
               </div>
+            </div>
+          </section>
+
+          <section>
+            <div className="setting-row column">
+              <div className="setting-label">
+                <span>链接索引</span>
+                <small>
+                  文档里的 []() 与 [[ ]] 会被解析成一张引用图。AI 读文档时直接拿到「它引用了谁、被谁引用」，点击预览里的链接也能直接跳转
+                </small>
+              </div>
+              <div className="link-stats">
+                <span>{linkStats ? `${linkStats.docs} 篇` : '统计中…'}</span>
+                {linkStats && <span>{linkStats.edges} 条引用</span>}
+                {linkStats && linkStats.broken > 0 && (
+                  <span className="link-bad">{linkStats.broken} 处断链</span>
+                )}
+                {linkStats && linkStats.ambiguous > 0 && (
+                  <span className="link-warn">{linkStats.ambiguous} 处歧义</span>
+                )}
+                {linkStats && <span className="link-ms">{linkStats.ms} ms</span>}
+                <button className="btn-ghost" onClick={reindexLinks} disabled={linkBusy}>
+                  {linkBusy ? '重建中…' : '重建'}
+                </button>
+                {linkStats && linkStats.broken + linkStats.ambiguous > 0 && (
+                  <button className="btn-ghost" onClick={toggleBroken}>
+                    {brokenList ? '收起' : '查看'}
+                  </button>
+                )}
+              </div>
+              {brokenList && (
+                <div className="ext-list">
+                  {brokenList.length === 0 && <div className="ext-empty">没有断链</div>}
+                  {brokenList.slice(0, 60).map((b, i) => (
+                    <div className="ext-row" key={`${b.from}-${b.line}-${i}`}>
+                      <div className="ext-main">
+                        <span className="ext-name">{b.raw}</span>
+                        <span className="ext-sub">
+                          {b.fromTitle} · 第 {b.line} 行
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                  {brokenList.length > 60 && (
+                    <div className="ext-empty">…另有 {brokenList.length - 60} 处</div>
+                  )}
+                </div>
+              )}
             </div>
           </section>
 
