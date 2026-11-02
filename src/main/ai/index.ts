@@ -6,6 +6,7 @@ import { foldMessages, summarize } from './compact'
 import { SkillStore } from './skills'
 import { McpManager } from './mcp'
 import { BUILTIN_TOOLS, execTool, pendingWrites } from './tools'
+import { recordWrite } from '../history'
 import type {
   AiSession,
   AiSessionMessage,
@@ -464,6 +465,7 @@ export function registerAi(userDir: string, getWindow: () => BrowserWindow | nul
       if (current === null) return { ok: false, message: '文档已经不在了，提案作废' }
       if (current !== w.before) return { ok: false, message: '文档在这期间被改过，提案已过期，让 AI 重新生成一次' }
       await vault.write(w.path, w.after)
+      recordWrite({ path: w.path, before: w.before, after: w.after, label: `修改「${w.title}」`, reqId: w.reqId })
       pendingWrites.delete(id)
       return { ok: true, path: w.path, content: w.after, before: w.before }
     } catch (err) {

@@ -2301,6 +2301,24 @@ button.backlink-row:hover {
 .toast svg {
   color: var(--acc);
 }
+/* 可撤销的提示：多给一个按钮，让人当场就能退回去 */
+.toast-msg {
+  max-width: 46ch;
+}
+.toast-action {
+  margin-left: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  color: var(--acc);
+  background: var(--acc-soft);
+  border: 1px solid var(--acc-line);
+  transition: background 0.14s;
+}
+.toast-action:hover {
+  background: var(--acc);
+  color: var(--bg);
+}
 @keyframes toastIn {
   from {
     opacity: 0;
@@ -2889,6 +2907,53 @@ button.backlink-row:hover {
   color: var(--acc);
   border-color: var(--acc-line);
   background: var(--acc-soft);
+}
+
+/* 这一轮改过磁盘时，在回答底部留一条可撤销的入口 */
+.ai-undo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 6px 9px;
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--txt-3);
+  background: var(--panel-hover);
+  border: 1px solid var(--line);
+}
+.ai-undo-text {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ai-undo-text svg {
+  flex: 0 0 auto;
+  color: var(--acc);
+}
+.ai-undo button {
+  flex: 0 0 auto;
+  margin-left: auto;
+  height: 20px;
+  padding: 0 9px;
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--acc);
+  border: 1px solid var(--acc-line);
+  background: var(--acc-soft);
+  transition: background 0.14s, color 0.14s;
+}
+.ai-undo button:hover {
+  color: var(--bg);
+  background: var(--acc);
+}
+.ai-undo.is-done {
+  color: var(--txt-3);
+  background: transparent;
 }
 
 /* AI 的待确认修改：只提议，落盘要用户点「应用」 */

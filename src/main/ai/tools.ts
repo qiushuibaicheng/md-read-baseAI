@@ -413,7 +413,7 @@ export async function execTool(name: string, rawArgs: string, ctx: ToolCtx): Pro
       if (!content) return 'content 为空，新建文档至少要给正文'
       if (content.length > 60000) return '内容超过 6 万字符，请拆成多篇'
       const dir = normPath(args.dir)
-      const rel = await vault.create(title, content, dir || undefined)
+      const rel = await vault.create(title, content, dir || undefined, ctx.reqId)
       ctx.send('ai:doc-created', { path: rel, title: titleOf(rel) })
       return `已新建文档：${rel}（${content.length} 字符）。需要继续改可以直接用 edit_doc。`
     }
@@ -473,7 +473,7 @@ export async function execTool(name: string, rawArgs: string, ctx: ToolCtx): Pro
       const p = normPath(args.path)
       if (!p) return '缺少 path 参数'
       const toDir = normPath(args.to_dir)
-      const next = await vault.move(p, toDir, String(args.new_name || '').trim() || undefined)
+      const next = await vault.move(p, toDir, String(args.new_name || '').trim() || undefined, ctx.reqId)
       return next === p ? '位置没变（已经在目标目录里，名字也一样）' : `已移动：${p} → ${next}`
     }
     if (name === 'delete_entry') {

@@ -244,6 +244,17 @@ export interface InkAPI {
       failed?: string
     }) => void
   ): () => void
+  /** 移动/改名后路径变了：旧路径 → 新路径 */
+  onVaultMoved(cb: (info: { moves: Record<string, string> }) => void): () => void
+  historyInfo(reqId: string): Promise<{ count: number; labels: string[] }>
+  historyUndo(reqId?: string): Promise<{
+    ok: boolean
+    count: number
+    restored: number
+    skipped: number
+    label: string
+    note?: string
+  }>
   saveSnippets(list: Snippet[]): Promise<boolean>
   copyText(text: string): Promise<boolean>
   readClipboard(): Promise<string>

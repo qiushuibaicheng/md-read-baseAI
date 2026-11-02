@@ -30,6 +30,8 @@ export interface RelinkOutcome {
   applied: RelinkChange[]
   skipped: RelinkSkipped[]
   files: number
+  /** 每个被改写文件的改前/改后全文，供撤销时原样写回 */
+  snapshots: { path: string; before: string; after: string }[]
 }
 
 const dirOf = (p: string) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '')
@@ -67,7 +69,7 @@ async function applyToFile(
   root: string,
   rel: string,
   list: (RelinkChange & { col: number })[]
-): Promise<{ applied: RelinkChange[]; skipped: RelinkSkipped[] }> {
+): Promise<{ applied: RelinkChange[]; skipped: RelinkSkipped[]; snapshot?: { before: string; after: string } }> {
   const applied: RelinkChange[] = []
   const skipped: RelinkSkipped[] = []
 
@@ -109,7 +111,7 @@ async function applyToFile(
   }
 
   if (touched) await fsp.writeFile(join(root, rel), lines.join('\n'), 'utf8')
-  return { applied, skipped }
+  return { applied, skipped, snapshot: touched ? { before: text, after: lines.join('\n') } : undefined }
 }
 
 /**
@@ -139,6 +141,7 @@ export async function applyRelink(
 
   const applied: RelinkChange[] = []
   const skipped: RelinkSkipped[] = []
+  const snapshots: { path: string; before: string; after: string }[] = []
   let files = 0
 
   // 分小批并发，移动一个被上百篇引用的文档时不至于串行卡住
@@ -146,12 +149,14 @@ export async function applyRelink(
   for (let i = 0; i < entries.length; i += 12) {
     const batch = entries.slice(i, i + 12)
     const out = await Promise.all(batch.map(([rel, list]) => applyToFile(root, rel, list)))
-    for (const r of out) {
+    for (let j = 0; j < out.length; j++) {
+      const r = out[j]
       applied.push(...r.applied)
       skipped.push(...r.skipped)
       if (r.applied.length) files++
+      if (r.snapshot) snapshots.push({ path: batch[j][0], ...r.snapshot })
     }
   }
 
-  return { applied, skipped, files }
+  return { applied, skipped, files, snapshots }
 }

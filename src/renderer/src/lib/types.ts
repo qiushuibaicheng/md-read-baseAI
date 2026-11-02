@@ -52,6 +52,12 @@ export interface AiSessionMessage {
   tools?: string[]
   /** 面板上展示的执行计划 */
   plan?: PlanStep[]
+  /** 这一轮对应的请求 id，用于「撤销这次操作」 */
+  reqId?: string
+  /** 这一轮真正改了磁盘时记下的可撤销信息 */
+  undo?: { count: number; labels: string[] }
+  /** 已经撤销过 */
+  undone?: boolean
 }
 
 export interface PlanStep {

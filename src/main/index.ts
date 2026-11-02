@@ -23,6 +23,8 @@ import { registerAi, shutdownAi } from './ai'
 import { LinkIndex } from './links'
 import type { InboundEdge } from './links'
 import { applyRelink } from './relink'
+import type { RelinkOutcome } from './relink'
+import { initHistory, recordCreate, recordMove, undoLast, infoFor } from './history'
 
 // ---------------------------------------------------------------------------
 // 基础路径
@@ -350,6 +352,18 @@ function remapOpenPaths(from: string, to: string) {
   if (config.lastDoc) config.lastDoc = map(config.lastDoc)
 }
 
+/**
+ * 告诉界面「哪些路径变了」。
+ *
+ * config 里的标签归主进程管，可渲染层的 tabs / 正文缓存 / 待存队列是另一套状态。
+ * 只改 config 不改界面的话，AI 移动一篇正打开的文档后，编辑器仍指向旧路径，
+ * 下一次自动保存会把旧目录重新建出来——同一篇文档变成两份。
+ */
+function notifyMoved(pairs: [string, string][]) {
+  if (!pairs.length) return
+  win?.webContents.send('vault:moved', { moves: Object.fromEntries(pairs) })
+}
+
 /** 新建的条目排到所在目录最前面，符合「刚建完就看得到」的直觉 */
 function unshiftOrder(relDir: string, rel: string) {
   const order = { ...(config.order || {}) }
@@ -384,8 +398,8 @@ async function relinkAfterMove(
   snapshot: Map<string, InboundEdge[]>,
   moves: Map<string, string>,
   from: string
-): Promise<void> {
-  if (!moves.size) return
+): Promise<RelinkOutcome | null> {
+  if (!moves.size) return null
   try {
     const out = await applyRelink(config.vaultPath, snapshot, moves)
     if (out.applied.length) {
@@ -397,6 +411,7 @@ async function relinkAfterMove(
         paths: [...new Set(out.applied.map((c) => c.path))]
       })
     }
+    return out
   } catch (err) {
     // 文件已经挪好了，改写失败不能让移动回滚；但必须让用户知道，
     // 否则他看到的只是一堆「莫名其妙」的断链。界面据此提示去检查失效清单。
@@ -409,6 +424,7 @@ async function relinkAfterMove(
       paths: [],
       failed: err instanceof Error ? err.message : String(err)
     })
+    return null
   }
 }
 
@@ -422,8 +438,14 @@ async function moveDocTo(rel: string, targetDir: string): Promise<string> {
   const snapshot = await linkIndex.snapshotInbound()
   await fsp.rename(abs, dest)
   const next = relOf(dest)
-  await relinkAfterMove(snapshot, new Map([[rel, next]]), rel)
+  const out = await relinkAfterMove(snapshot, new Map([[rel, next]]), rel)
   linkIndex.invalidate()
+  recordMove({
+    moves: [[rel, next]],
+    patches: out?.snapshots ?? [],
+    label: targetDir ? `移动到「${basename(targetDir)}」` : '移到根目录'
+  })
+  notifyMoved([[rel, next]])
   return next
 }
 
@@ -444,11 +466,17 @@ async function moveFolderTo(rel: string, targetDir: string): Promise<string> {
   const next = relOf(dest)
   const moves = new Map<string, string>()
   for (const p of inner) moves.set(p, next + p.slice(rel.length))
-  await relinkAfterMove(snapshot, moves, rel)
+  const out = await relinkAfterMove(snapshot, moves, rel)
   linkIndex.invalidate()
   remapOpenPaths(rel, next)
   remapOrder(rel, next)
   notifyConfig()
+  recordMove({
+    moves: [[rel, next]],
+    patches: out?.snapshots ?? [],
+    label: targetDir ? `文件夹移到「${basename(targetDir)}」` : '文件夹移到根目录'
+  })
+  notifyMoved([[rel, next]])
   return next
 }
 
@@ -484,7 +512,7 @@ function outlineOf(text: string): { level: number; text: string; line: number }[
  * AI 用的移动/改名：文档和文件夹共用一条路。
  * 与拖拽的区别是它可能同时改名，所以路径改写要一次做完（order 键、标签、上次文档）。
  */
-async function moveEntryAny(from: string, toDir: string, newName?: string): Promise<string> {
+async function moveEntryAny(from: string, toDir: string, newName?: string, reqId?: string): Promise<string> {
   const abs = safePath(from)
   if (!existsSync(abs)) throw new Error(`找不到 ${from}`)
   const stat = await fsp.stat(abs)
@@ -518,7 +546,7 @@ async function moveEntryAny(from: string, toDir: string, newName?: string): Prom
   // 文件夹里的每篇文档路径都变了，逐条重算指向它们的链接
   const moved = new Map<string, string>([[from, next]])
   for (const p of innerDocs) moved.set(p, next + p.slice(from.length))
-  await relinkAfterMove(snapshot, moved, from)
+  const out = await relinkAfterMove(snapshot, moved, from)
 
   const fromDir = dirRelOf(from)
 
@@ -535,6 +563,16 @@ async function moveEntryAny(from: string, toDir: string, newName?: string): Prom
   notifyConfig()
   // 移动/改名会改变相对链接的基准，整个图都得重算
   linkIndex.invalidate()
+  recordMove({
+    moves: [[from, next]],
+    patches: out?.snapshots ?? [],
+    label:
+      basename(from) !== basename(next)
+        ? `重命名为「${basename(next).replace(/\.md$/i, '')}」`
+        : `移动到「${cleanDir || '根目录'}」`,
+    reqId
+  })
+  notifyMoved([[from, next]])
   win?.webContents.send('vault:changed', await scanVault())
   return next
 }
@@ -892,12 +930,18 @@ function setupIPC() {
     const snapshot = await linkIndex.snapshotInbound()
     await fsp.rename(abs, nextAbs)
     const next = relative(config.vaultPath, nextAbs).split('\\').join('/')
-    await relinkAfterMove(snapshot, new Map([[rel, next]]), rel)
+    const out = await relinkAfterMove(snapshot, new Map([[rel, next]]), rel)
     linkIndex.invalidate()
     remapOrder(rel, next)
     remapOpenPaths(rel, next)
     saveConfig()
     notifyConfig()
+    recordMove({
+      moves: [[rel, next]],
+      patches: out?.snapshots ?? [],
+      label: `重命名为「${clean.replace(/\.md$/i, '')}」`
+    })
+    notifyMoved([[rel, next]])
     return next
   })
 
@@ -951,12 +995,18 @@ function setupIPC() {
     const next = relOf(dest)
     const moves = new Map<string, string>()
     for (const p of inner) moves.set(p, next + p.slice(from.length))
-    await relinkAfterMove(snapshot, moves, from)
+    const out = await relinkAfterMove(snapshot, moves, from)
     linkIndex.invalidate()
     remapOpenPaths(from, next)
     remapOrder(from, next)
     saveConfig()
     notifyConfig()
+    recordMove({
+      moves: [[from, next]],
+      patches: out?.snapshots ?? [],
+      label: `文件夹改名为「${clean}」`
+    })
+    notifyMoved([[from, next]])
     win?.webContents.send('vault:changed', await scanVault())
     return next
   })
@@ -1083,6 +1133,16 @@ function setupIPC() {
     await linkIndex.sync(true)
     return linkIndex.statsNow()
   })
+
+  // 撤销：AI 面板按 reqId 退掉一整轮，界面上的移动按最后一条退
+  ipcMain.handle('history:info', (_e, reqId: string) => infoFor(reqId))
+  ipcMain.handle('history:undo', async (_e, reqId?: string) => {
+    const res = await undoLast(reqId)
+    if (!res.ok) return res
+    win?.webContents.send('vault:changed', await scanVault())
+    win?.webContents.send('links:changed')
+    return res
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,6 +1197,23 @@ if (!gotLock) {
     linkIndex.setRoot(config.vaultPath)
     // 后台先把索引建起来，别等第一次对话才付这份时间
     linkIndex.sync(true).catch(() => undefined)
+    initHistory({
+      root: () => config.vaultPath,
+      onChanged: async (moves) => {
+        for (const [from, to] of moves) {
+          remapOrder(from, to)
+          remapOpenPaths(from, to)
+        }
+        if (moves.length) {
+          saveConfig()
+          notifyConfig()
+        }
+        linkIndex.invalidate()
+        notifyMoved(moves)
+        win?.webContents.send('vault:changed', await scanVault())
+        win?.webContents.send('links:changed')
+      }
+    })
     protocol.handle('ink-asset', (request) => {
       const url = new URL(request.url)
       const target = url.searchParams.get('p')
@@ -1164,7 +1241,7 @@ if (!gotLock) {
         await fsp.writeFile(abs, content, 'utf-8')
         linkIndex.invalidate(rel)
       },
-      create: async (title: string, content: string, dir?: string) => {
+      create: async (title: string, content: string, dir?: string, reqId?: string) => {
         const dirAbs = dir ? safePath(dir) : config.vaultPath
         ensureDir(dirAbs)
         const clean = title.replace(/[\\/:*?"<>|]/g, '').trim() || '未命名'
@@ -1174,6 +1251,7 @@ if (!gotLock) {
         const rel = relative(config.vaultPath, abs).split('\\').join('/')
         unshiftOrder(dir || '', rel)
         linkIndex.invalidate()
+        recordCreate({ path: rel, label: `新建「${clean}」`, reqId })
         win?.webContents.send('vault:changed', await scanVault())
         return rel
       },
@@ -1193,7 +1271,8 @@ if (!gotLock) {
         win?.webContents.send('vault:changed', await scanVault())
         return clean
       },
-      move: (from: string, toDir: string, newName?: string) => moveEntryAny(from, toDir, newName),
+      move: (from: string, toDir: string, newName?: string, reqId?: string) =>
+        moveEntryAny(from, toDir, newName, reqId),
       remove: async (rel: string) => {
         const abs = safePath(rel)
         await shell.trashItem(abs)

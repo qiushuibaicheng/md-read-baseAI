@@ -290,6 +290,13 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
         setLive(null)
         setToolNote(null)
         scrollToBottom()
+        // 这一轮真的动过磁盘才给撤销入口：只说没做的，不必让人以为能退
+        window.api
+          .historyInfo(d.reqId)
+          .then((info) => {
+            if (info.count) patchMessage(target.sessionId, target.messageId, { undo: info })
+          })
+          .catch(() => undefined)
       }),
       window.api.aiOnError((d) => {
         const target = pending.current.get(d.reqId)
@@ -359,6 +366,26 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
     return () => offs.forEach((off) => off())
   }, [patchMessage, scrollToBottom, mutateSession])
 
+  // ---------------------------------------------------------------- 撤销
+  /**
+   * 退掉这一轮 AI 动过的东西：移动/改名（连带它改写的引用）、应用过的提案、新建的文档。
+   * 主进程按 reqId 找到这一轮的全部事务，倒序回退。
+   */
+  const undoTurn = async (m: AiSessionMessage) => {
+    if (!m.reqId) return
+    const res = await window.api.historyUndo(m.reqId)
+    if (!res.ok) {
+      onToast('没有可撤销的操作了')
+      return
+    }
+    if (session) patchMessage(session.id, m.id, { undo: undefined, undone: true })
+    onToast(
+      res.skipped
+        ? `已撤销「${res.label}」，${res.skipped} 个文件之后被改过，只还原了位置`
+        : `已撤销「${res.label}」`
+    )
+  }
+
   // ---------------------------------------------------------------- 发送
   const send = useCallback(
     async (text: string, opts: { display?: string; insertable?: boolean } = {}) => {
@@ -378,12 +405,14 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
         time: now
       }
       const assistantId = uid()
+      const reqId = uid()
       const assistantMsg: AiSessionMessage = {
         id: assistantId,
         role: 'assistant',
         content: '',
         time: now,
-        model: activeModel.model
+        model: activeModel.model,
+        reqId
       }
 
       mutateSession(current.id, (s) => ({
@@ -395,7 +424,6 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
       }))
 
       // 先把气泡挂上去，读盘与请求都在之后，避免界面卡住
-      const reqId = uid()
       pending.current.set(reqId, { sessionId: current.id, messageId: assistantId })
       setLive({ reqId, id: assistantId })
       setToolNote(null)
@@ -769,6 +797,26 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
                     <span>{m.error}</span>
                   </div>
                 )}
+
+                {!live && m.undo?.count ? (
+                  <div className="ai-undo">
+                    <span className="ai-undo-text">
+                      <Icon name="refresh" size={11} />
+                      这次动了 {m.undo.count} 处：{m.undo.labels.slice(-2).join('、')}
+                      {m.undo.labels.length > 2 ? ' 等' : ''}
+                    </span>
+                    <button onClick={() => void undoTurn(m)}>撤销</button>
+                  </div>
+                ) : null}
+
+                {!live && m.undone ? (
+                  <div className="ai-undo is-done">
+                    <span className="ai-undo-text">
+                      <Icon name="check" size={11} />
+                      这次操作已撤销
+                    </span>
+                  </div>
+                ) : null}
 
                 {m.content && !live && (
                   <div className="ai-msg-actions">

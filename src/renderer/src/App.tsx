@@ -153,7 +153,12 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [modelsOpen, setModelsOpen] = useState(false)
   const [aiOpen, setAiOpen] = useState(false)
-  const [toast, setToast] = useState<{ id: number; msg: string; bad?: boolean } | null>(null)
+  const [toast, setToast] = useState<{
+    id: number
+    msg: string
+    bad?: boolean
+    action?: { label: string; run: () => void }
+  } | null>(null)
   const [split, setSplit] = useState(0.5)
   const [dragging, setDragging] = useState(false)
   const [dropping, setDropping] = useState(false)
@@ -173,6 +178,8 @@ export default function App() {
   const pending = useRef<Record<string, string>>({})
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const prevActive = useRef<string | null>(null)
+  /** 事件回调里要用最新的 flushSave，避免闭包拿到首帧的配置 */
+  const flushRef = useRef<(path: string) => void>(() => undefined)
   const aiRef = useRef<AiPanelHandle | null>(null)
   const titledRef = useRef<Set<string>>(new Set())
 
@@ -220,6 +227,20 @@ export default function App() {
         window.api.listFolders().then(setFolders).catch(() => undefined)
       }),
       window.api.onConfigChanged(setConfig),
+      // AI 移动/改名后，界面里的路径也得跟着搬：只改主进程 config 不改这里的话，
+      // 编辑器仍指着旧路径，下一次自动保存会在旧位置重建一份副本。
+      window.api.onVaultMoved((info) => {
+        const arrived: string[] = []
+        Object.entries(info.moves).forEach(([from, to]) => {
+          arrived.push(...remapPaths(from, to))
+        })
+        // 旧路径上还有没落盘的内容：写到新位置，别让它随旧路径一起消失
+        arrived.forEach((p) => flushRef.current(p))
+      }),
+      window.api.aiOnDocCreated(async () => {
+        setDocs(await window.api.listDocs())
+        window.api.listFolders().then(setFolders).catch(() => undefined)
+      }),
       window.api.onThemeSystem(setSystemDark),
       window.api.onWindowShown(() => {
         setSearchOpen(false)
@@ -289,6 +310,12 @@ export default function App() {
       setSaving(false)
     }
   }, [config.aiModelId, config.aiAutoTitle])
+
+  useEffect(() => {
+    flushRef.current = (path: string) => {
+      void flushSave(path)
+    }
+  }, [flushSave])
 
   useEffect(() => {
     if (prevActive.current && prevActive.current !== active) flushSave(prevActive.current)
@@ -367,11 +394,28 @@ export default function App() {
     setOutlineId(null)
   }
 
-  const showToast = useCallback((msg: string, bad = false) => {
-    setToast({ id: Date.now(), msg, bad })
+  const showToast = useCallback((msg: string, bad = false, action?: { label: string; run: () => void }) => {
+    setToast({ id: Date.now(), msg, bad, action })
     if (toastTimer.current) clearTimeout(toastTimer.current)
-    toastTimer.current = setTimeout(() => setToast(null), bad ? 2600 : 1700)
+    // 带按钮的多留一会儿，否则还没反应过来就消失了
+    toastTimer.current = setTimeout(() => setToast(null), action ? 6000 : bad ? 2600 : 1700)
   }, [])
+
+  /** 撤回刚刚那一下结构操作（移动/改名/链接改写）；正文编辑仍走编辑器自己的 Ctrl+Z */
+  const doUndo = useCallback(async () => {
+    const res = await window.api.historyUndo()
+    if (!res.ok) {
+      showToast('没有可撤销的操作', true)
+      return
+    }
+    showToast(
+      res.skipped
+        ? `已撤销：${res.label}（${res.skipped} 个文件之后被改过，只还原了位置）`
+        : `已撤销：${res.label}`
+    )
+  }, [showToast])
+
+  const undoAction = useCallback(() => ({ label: '撤销', run: () => void doUndo() }), [doUndo])
 
   // 移动/改名后主进程自动改写了链接：把受影响的文档重新读一遍，并交代改了多少处
   useEffect(
@@ -486,6 +530,7 @@ export default function App() {
     const rel = await window.api.renameDoc(path, name)
     remapPaths(path, rel)
     setDocs(await window.api.listDocs())
+    showToast(`已重命名为「${name}」`, false, undoAction())
   }
 
   const errText = (err: unknown) =>
@@ -501,7 +546,7 @@ export default function App() {
    * 标签、正文缓存、脏标记、待存内容、当前文档、插入点、AI 提案、撤回快照。
    * 文件夹移动时 from 是前缀，子路径一并改写。
    */
-  const remapPaths = (from: string, to: string) => {
+  const remapPaths = (from: string, to: string): string[] => {
     const map = (p: string) => (p === from || p.startsWith(`${from}/`) ? to + p.slice(from.length) : p)
     setTabs((t) => t.map(map))
     setContents((c) => {
@@ -518,17 +563,21 @@ export default function App() {
       })
       return out
     })
+    // 待存内容跟着搬；返回搬到了哪些新路径，调用方据此决定要不要立刻落盘
+    const arrived: string[] = []
     Object.keys(pending.current).forEach((k) => {
       const nk = map(k)
       if (nk !== k) {
         pending.current[nk] = pending.current[k]
         delete pending.current[k]
+        arrived.push(nk)
       }
     })
     setActive((a) => (a ? map(a) : a))
     if (caretRef.current) caretRef.current.path = map(caretRef.current.path)
     setWrites((list) => list.map((w) => (map(w.path) === w.path ? w : { ...w, path: map(w.path) })))
     setUndo((u) => (u && map(u.path) !== u.path ? { ...u, path: map(u.path) } : u))
+    return arrived
   }
 
   /** 拖拽落位：跨目录移动 + 手动排序，一次请求搞定，避免拖完顺序又被打回字母序 */
@@ -539,7 +588,7 @@ export default function App() {
       if (res.rel !== payload.path) {
         remapPaths(payload.path, res.rel)
         const label = payload.targetDir ? `「${payload.targetDir.split('/').pop()}」` : '根目录'
-        showToast(payload.kind === 'dir' ? `文件夹已移到${label}` : `已移到${label}`)
+        showToast(payload.kind === 'dir' ? `文件夹已移到${label}` : `已移到${label}`, false, undoAction())
       }
       setConfig((c) => ({ ...c, order: res.order || {} }))
       setDocs(res.docs)
@@ -560,7 +609,7 @@ export default function App() {
       const rel = await window.api.moveDoc(path, dir)
       remapPaths(path, rel)
       setDocs(await window.api.listDocs())
-      showToast(dir ? `已移动到「${dir.split('/').pop()}」` : '已移到根目录')
+      showToast(dir ? `已移动到「${dir.split('/').pop()}」` : '已移到根目录', false, undoAction())
     } catch (err) {
       showToast(errText(err), true)
     }
@@ -572,7 +621,7 @@ export default function App() {
       remapPaths(rel, next)
       setFolders(await window.api.listFolders())
       setDocs(await window.api.listDocs())
-      showToast(`文件夹已重命名为「${name}」`)
+      showToast(`文件夹已重命名为「${name}」`, false, undoAction())
     } catch (err) {
       showToast(errText(err), true)
     }
@@ -1583,7 +1632,19 @@ export default function App() {
       {toast && (
         <div className={`toast${toast.bad ? ' is-bad' : ''}`} key={toast.id}>
           <Icon name={toast.bad ? 'alert' : 'check'} size={13} />
-          {toast.msg}
+          <span className="toast-msg">{toast.msg}</span>
+          {toast.action && (
+            <button
+              className="toast-action"
+              onClick={() => {
+                const run = toast.action?.run
+                setToast(null)
+                run?.()
+              }}
+            >
+              {toast.action.label}
+            </button>
+          )}
         </div>
       )}
     </div>

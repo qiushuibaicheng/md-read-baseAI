@@ -92,14 +92,14 @@ export interface VaultAccess {
   search(query: string): Promise<{ path: string; title: string; hits: { line: number; text: string }[] }[]>
   /** 覆盖写入（仅用于用户已确认的提案） */
   write(path: string, content: string): Promise<void>
-  /** 新建文档，返回相对路径 */
-  create(title: string, content: string, dir?: string): Promise<string>
+  /** 新建文档，返回相对路径。reqId 用于把这些操作归到同一轮，方便一键撤销 */
+  create(title: string, content: string, dir?: string, reqId?: string): Promise<string>
   /** 所有文件夹相对路径 */
   folders(): Promise<string[]>
   /** 新建文件夹，返回相对路径 */
   createFolder(rel: string): Promise<string>
   /** 移动/改名，返回新相对路径 */
-  move(from: string, toDir: string, newName?: string): Promise<string>
+  move(from: string, toDir: string, newName?: string, reqId?: string): Promise<string>
   /** 移到系统回收站 */
   remove(rel: string): Promise<void>
   /** 文档标题树 */

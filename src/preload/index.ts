@@ -42,6 +42,10 @@ const api = {
   onVaultRelinked: (
     cb: (info: { from: string; count: number; files: number; skipped: number; paths: string[] }) => void
   ) => on('vault:relinked', cb),
+  /** 移动/改名后通知界面把标签、正文缓存、待存队列一起搬过去 */
+  onVaultMoved: (cb: (info: { moves: Record<string, string> }) => void) => on('vault:moved', cb),
+  historyInfo: (reqId: string) => ipcRenderer.invoke('history:info', reqId),
+  historyUndo: (reqId?: string) => ipcRenderer.invoke('history:undo', reqId),
   saveSnippets: (list: unknown) => ipcRenderer.invoke('snippets:save', list),
 
   copyText: (text: string) => ipcRenderer.invoke('clipboard:write', text),
