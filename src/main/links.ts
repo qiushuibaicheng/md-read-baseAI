@@ -278,11 +278,20 @@ export class LinkIndex {
     return hit || null
   }
 
-  /** 按需同步；并发调用共享同一次构建 */
+  /**
+   * 按需同步；并发调用共享同一次构建。
+   *
+   * force 的两层含义：等到手头这次构建结束之后**再建一次**（否则点「重建」会被进行中的
+   * 构建吞掉），并且这次不做 mtime/size 增量判断、全部重新解析（否则时间戳被保留的
+   * 文件永远读不进来）。
+   */
   async sync(force = false): Promise<void> {
-    if (this.building) return this.building
+    if (this.building) {
+      await this.building
+      if (!force) return
+    }
     if (!force && !this.dirty && Date.now() - this.lastSync < SYNC_TTL) return
-    this.building = this.build()
+    this.building = this.build(force)
       .catch(() => undefined)
       .finally(() => {
         this.building = null
@@ -290,7 +299,7 @@ export class LinkIndex {
     return this.building
   }
 
-  private async build() {
+  private async build(force = false) {
     if (!this.root) return
     const started = Date.now()
     const seen = new Set<string>()
@@ -333,8 +342,9 @@ export class LinkIndex {
     // 删掉已经不存在的
     for (const p of [...this.docs.keys()]) if (!seen.has(p)) this.docs.delete(p)
 
-    // 只重解析变过的
+    // 只重解析变过的；force 时全部重解析
     const queue = fresh.filter((f) => {
+      if (force) return true
       const hit = this.docs.get(f.path)
       return !hit || hit.mtime !== f.mtime || hit.size !== f.size
     })

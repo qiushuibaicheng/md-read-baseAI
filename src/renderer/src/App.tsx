@@ -377,6 +377,10 @@ export default function App() {
   useEffect(
     () =>
       window.api.onVaultRelinked(async (info) => {
+        if (info.failed) {
+          showToast(`引用没能自动改写（${info.failed}），请到设置里查看失效链接`)
+          return
+        }
         const fresh = info.paths.filter((p) => !dirty[p])
         for (const p of fresh) {
           if (!tabs.includes(p)) {

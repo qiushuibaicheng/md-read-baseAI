@@ -397,8 +397,18 @@ async function relinkAfterMove(
         paths: [...new Set(out.applied.map((c) => c.path))]
       })
     }
-  } catch {
-    /* 静默跳过，不影响移动结果 */
+  } catch (err) {
+    // 文件已经挪好了，改写失败不能让移动回滚；但必须让用户知道，
+    // 否则他看到的只是一堆「莫名其妙」的断链。界面据此提示去检查失效清单。
+    console.warn('[inkwell] 改写引用失败:', err)
+    win?.webContents.send('vault:relinked', {
+      from,
+      count: 0,
+      files: 0,
+      skipped: 0,
+      paths: [],
+      failed: err instanceof Error ? err.message : String(err)
+    })
   }
 }
 
@@ -771,6 +781,9 @@ function setupIPC() {
   })
 
   ipcMain.handle('config:set', (_e, patch: Partial<Config>) => {
+    // 库路径只能走 vault:pick：换库要重建索引、换监听目标、清空打开状态，
+    // 走这里改会留下一个指向旧目录的索引。
+    if (patch && 'vaultPath' in patch) delete (patch as Record<string, unknown>).vaultPath
     const prevHotkey = config.hotkey
     config = { ...config, ...patch }
     saveConfig()
@@ -851,6 +864,9 @@ function setupIPC() {
     const abs = safePath(rel)
     await fsp.mkdir(dirname(abs), { recursive: true })
     await fsp.writeFile(abs, content, 'utf-8')
+    // 不等目录监听的 600ms 防抖：保存完立刻问 AI「这篇引用了谁」时，
+    // 拿到的应该是刚写下的链接图，而不是上一版。
+    linkIndex.invalidate(rel)
     return true
   })
 
@@ -865,6 +881,7 @@ function setupIPC() {
     await fsp.writeFile(abs, `# ${payload.title?.trim() || '未命名文档'}\n\n`, 'utf-8')
     const rel = relative(config.vaultPath, abs).split('\\').join('/')
     unshiftOrder(payload.dir || '', rel)
+    linkIndex.invalidate(rel)
     return rel
   })
 
@@ -888,6 +905,8 @@ function setupIPC() {
     const abs = safePath(rel)
     await shell.trashItem(abs)
     dropFromOrder(rel)
+    linkIndex.invalidate(rel)
+    win?.webContents.send('links:changed')
     return true
   })
 
@@ -896,7 +915,9 @@ function setupIPC() {
     const name = uniqueName(config.vaultPath, base)
     const dest = join(config.vaultPath, name)
     await fsp.copyFile(absPath, dest)
-    return relative(config.vaultPath, dest).split('\\').join('/')
+    const rel = relative(config.vaultPath, dest).split('\\').join('/')
+    linkIndex.invalidate(rel)
+    return rel
   })
 
   ipcMain.handle('doc:reveal', async (_e, rel: string) => {
@@ -913,17 +934,30 @@ function setupIPC() {
 
   // 侧栏右键：新建/重命名/删除文件夹
   ipcMain.handle('folder:rename', async (_e, rel: string, nextName: string) => {
-    const abs = safePath(rel)
+    const from = rel.replace(/^\.?\//, '').replace(/\/+$/, '')
+    const abs = safePath(from)
     const clean = (nextName || '').replace(/[\\/:*?"<>|]/g, '').trim()
     if (!clean) throw new Error('文件夹名不能为空')
     const dest = join(dirname(abs), clean)
+    if (resolve(dest) === resolve(abs)) return from
     if (existsSync(dest)) throw new Error(`「${clean}」已存在`)
+    // 改名会改变所有内部文档的路径基准：外部指进来的链接必须跟着改写，
+    // 否则一改名就静默断链（内部互链的相对关系不变，所以从界面看不出来）。
+    const snapshot = await linkIndex.snapshotInbound()
+    const inner = (await linkIndex.list())
+      .map((d) => d.path)
+      .filter((p) => p.startsWith(`${from}/`))
     await fsp.rename(abs, dest)
-    const next = relative(config.vaultPath, dest).split('\\').join('/')
-    // 同步改写已打开标签里位于该文件夹的路径
-    remapOpenPaths(rel.replace(/\/+$/, ''), next)
-    remapOrder(rel.replace(/\/+$/, ''), next)
+    const next = relOf(dest)
+    const moves = new Map<string, string>()
+    for (const p of inner) moves.set(p, next + p.slice(from.length))
+    await relinkAfterMove(snapshot, moves, from)
+    linkIndex.invalidate()
+    remapOpenPaths(from, next)
+    remapOrder(from, next)
     saveConfig()
+    notifyConfig()
+    win?.webContents.send('vault:changed', await scanVault())
     return next
   })
 
@@ -1056,20 +1090,36 @@ function setupIPC() {
 // ---------------------------------------------------------------------------
 let watcher: FSWatcher | null = null
 let watchTimer: NodeJS.Timeout | null = null
+/** 防抖窗口内攒下的待失效路径；空串表示「有事件但拿不到文件名」 */
+let pendingPaths = new Set<string>()
+
 function startVaultWatch() {
   watcher?.close()
+  pendingPaths = new Set()
   try {
-    watcher = watch(config.vaultPath, { recursive: true }, () => {
+    watcher = watch(config.vaultPath, { recursive: true }, (_event, name) => {
+      // 拿到文件名才能做「单篇失效」：全库标脏会走 mtime/size 增量判断，
+      // 而同步盘、FAT 的 2 秒粒度、解压还原都可能让时间戳和大小都不变，
+      // 那种情况下内容变了索引却读不到。带路径失效会直接把这个条目踢出缓存。
+      pendingPaths.add(name ? String(name).split('\\').join('/').replace(/^\.?\//, '') : '')
       if (watchTimer) clearTimeout(watchTimer)
       watchTimer = setTimeout(async () => {
-        linkIndex.invalidate()
+        const paths = [...pendingPaths]
+        pendingPaths.clear()
+        if (!paths.length || paths.includes('')) linkIndex.invalidate()
+        else for (const p of paths) linkIndex.invalidate(p)
         if (!win) return
         win.webContents.send('vault:changed', await scanVault())
         win.webContents.send('links:changed')
       }, 600)
     })
-  } catch {
-    /* 某些文件系统不支持 recursive watch */
+    watcher.on('error', (err) => {
+      console.warn('[inkwell] 目录监听出错，索引改由查询时的 TTL 轮询兜底:', err)
+    })
+  } catch (err) {
+    // 某些文件系统不支持 recursive watch。索引仍会靠 sync() 的 TTL 轮询自愈，
+    // 只是精度退化成「下次查询时全量重扫」。
+    console.warn('[inkwell] 无法监听目录，索引改由查询时的 TTL 轮询兜底:', err)
   }
 }
 

@@ -235,7 +235,14 @@ export interface InkAPI {
   onLinksChanged(cb: () => void): () => void
   /** 移动/改名后自动改写了链接 */
   onVaultRelinked(
-    cb: (info: { from: string; count: number; files: number; skipped: number; paths: string[] }) => void
+    cb: (info: {
+      from: string
+      count: number
+      files: number
+      skipped: number
+      paths: string[]
+      failed?: string
+    }) => void
   ): () => void
   saveSnippets(list: Snippet[]): Promise<boolean>
   copyText(text: string): Promise<boolean>
