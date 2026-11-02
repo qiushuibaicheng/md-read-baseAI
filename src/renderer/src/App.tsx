@@ -5,6 +5,7 @@ import SearchPalette from './components/SearchPalette'
 import SettingsDialog from './components/SettingsDialog'
 import Preview from './components/Preview'
 import Backlinks from './components/Backlinks'
+import EditorGutter from './components/EditorGutter'
 import AiPanel, { type AiPanelHandle } from './components/AiPanel'
 import ModelsDialog from './components/ModelsDialog'
 import DiffDialog from './components/DiffDialog'
@@ -23,6 +24,20 @@ import type {
 } from './lib/types'
 
 const DEFAULT_HOTKEY = 'Alt+M'
+
+/**
+ * 提示里显示链接名字：优先用链接显示文字，其次用解码后的路径。
+ * href 里的中文是 URL 编码的（%E5%80%BC…），直接甩给用户没法看。
+ */
+const linkLabel = (raw: string, text?: string) => {
+  const t = (text || '').trim()
+  if (t) return t
+  try {
+    return decodeURIComponent(raw)
+  } catch {
+    return raw
+  }
+}
 
 const FALLBACK: AppConfig = {
   vaultPath: '',
@@ -362,14 +377,15 @@ export default function App() {
   const handleDocLink = useCallback(
     async (raw: string, anchor?: string, text?: string) => {
       if (!active) return
+      const name = linkLabel(raw, text)
       try {
         const res = await window.api.linksResolve(active, raw, text)
         if (!res.path) {
           const cand = (res.candidates || []).slice(0, 3).join(' / ')
           showToast(
             res.reason === 'ambiguous'
-              ? `「${raw}」同名多篇，未自动跳转${cand ? `：${cand}` : ''}`
-              : `库里找不到「${raw}」`,
+              ? `「${name}」同名多篇，未自动跳转${cand ? `：${cand}` : ''}`
+              : `库里找不到「${name}」`,
             true
           )
           return
@@ -378,7 +394,7 @@ export default function App() {
         const target = res.anchor || anchor
         if (target) setTimeout(() => scrollToAnchor(target), 260)
       } catch {
-        showToast(`打不开「${raw}」`, true)
+        showToast(`打不开「${name}」`, true)
       }
     },
     [active, scrollToAnchor, showToast]
@@ -1339,6 +1355,7 @@ export default function App() {
               >
                 {(mode === 'edit' || mode === 'split') && (
                   <div className="editor-pane">
+                    <EditorGutter text={activeContent} target={editorRef} />
                     <textarea
                       ref={editorRef}
                       className="editor"

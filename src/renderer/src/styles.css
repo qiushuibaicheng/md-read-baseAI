@@ -1090,11 +1090,52 @@ button.backlink-row:hover {
   border-right: 1px solid var(--line);
 }
 
+.editor-gutter {
+  position: relative;
+  flex: 0 0 auto;
+  width: 50px;
+  overflow: hidden;
+  background: var(--editor-bg);
+  color: var(--txt-3);
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  line-height: 1.82;
+  user-select: none;
+  pointer-events: none;
+  opacity: 0.55;
+}
+.editor-gutter-inner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+.editor-gutter-n {
+  position: absolute;
+  right: 9px;
+  line-height: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.editor-mirror {
+  position: absolute;
+  top: 0;
+  left: 0;
+  visibility: hidden;
+  pointer-events: none;
+  box-sizing: border-box;
+  white-space: pre-wrap;
+  overflow-wrap: normal;
+  word-break: normal;
+  line-height: inherit;
+  font: inherit;
+}
+
 .editor {
   flex: 1;
   width: 100%;
   resize: none;
-  padding: 24px 26px 120px;
+  padding: 24px 22px 120px 10px;
   font-family: var(--font-mono);
   font-size: 13.5px;
   line-height: 1.82;
