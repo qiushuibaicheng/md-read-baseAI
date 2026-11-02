@@ -36,7 +36,8 @@ const api = {
   linksBroken: () => ipcRenderer.invoke('links:broken'),
   linksStats: () => ipcRenderer.invoke('links:stats'),
   linksGraph: (rel: string, depth = 1) => ipcRenderer.invoke('links:graph', rel, depth),
-  linksResolve: (from: string, href: string) => ipcRenderer.invoke('links:resolve', from, href),
+  linksResolve: (from: string, href: string, text?: string) =>
+    ipcRenderer.invoke('links:resolve', from, href, text),
   linksReindex: () => ipcRenderer.invoke('links:index'),
   onLinksChanged: (cb: () => void) => on('links:changed', cb),
   saveSnippets: (list: unknown) => ipcRenderer.invoke('snippets:save', list),

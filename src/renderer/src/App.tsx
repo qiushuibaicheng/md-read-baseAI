@@ -358,15 +358,18 @@ export default function App() {
     toastTimer.current = setTimeout(() => setToast(null), bad ? 2600 : 1700)
   }, [])
 
-  /** 点预览里的库内链接：交给主进程解析，再跳过去 */
+  /** 点预览里的库内链接：交给主进程解析，再跳过去。text 是链接显示文字，跟索引走同一套判定 */
   const handleDocLink = useCallback(
-    async (raw: string, anchor?: string) => {
+    async (raw: string, anchor?: string, text?: string) => {
       if (!active) return
       try {
-        const res = await window.api.linksResolve(active, raw)
+        const res = await window.api.linksResolve(active, raw, text)
         if (!res.path) {
+          const cand = (res.candidates || []).slice(0, 3).join(' / ')
           showToast(
-            res.reason === 'ambiguous' ? `「${raw}」有多个同名目标，先确认路径` : `库里找不到「${raw}」`,
+            res.reason === 'ambiguous'
+              ? `「${raw}」同名多篇，未自动跳转${cand ? `：${cand}` : ''}`
+              : `库里找不到「${raw}」`,
             true
           )
           return

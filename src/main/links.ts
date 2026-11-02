@@ -523,12 +523,13 @@ export class LinkIndex {
         for (const p of nameHits.slice(0, 5)) push(p)
       }
 
-      // 4. 显示文字当标题，规则同上
+      // 4. 显示文字当标题。只在前三步都没命中时兜底：
+      //    否则「路径已经算对、只是显示文字恰好等于另一篇标题」的链接会被拖成歧义
       const titleKey = normTitle(r.text)
-      if (titleKey) {
+      if (titleKey && candidates.length === 0) {
         const titleHits = this.byTitle.get(titleKey) || []
         if (titleHits.length === 1) push(titleHits[0])
-        else if (titleHits.length > 1 && candidates.length === 0) {
+        else if (titleHits.length > 1) {
           for (const p of titleHits.slice(0, 5)) push(p)
         }
       }
@@ -587,7 +588,16 @@ export class LinkIndex {
   }
 
   /** 点击链接时用：把原始 href 解析成库内路径，失败返回 null */
-  async resolveHref(from: string, href: string): Promise<{ path: string | null; anchor?: string; reason: LinkReason }> {
+  /**
+   * 解析单个链接。text 是链接的显示文字，参与「按标题兜底」这一步；
+   * 界面上点链接时传 `a.textContent`，不传则退化为拿文件名当标题线索。
+   * 必须和索引内部走同一套判定，否则会出现「人点不动、AI 却读得到」。
+   */
+  async resolveHref(
+    from: string,
+    href: string,
+    text?: string
+  ): Promise<{ path: string | null; anchor?: string; reason: LinkReason; candidates?: string[] }> {
     await this.sync()
     const key = this.canon(from) || from
     let raw = href
@@ -598,8 +608,9 @@ export class LinkIndex {
       raw = raw.slice(0, hash)
     }
     if (!raw) return { path: key, anchor, reason: 'self' }
-    const target = this.resolve(key, { raw, text: '', line: 0, wiki: false, image: false })
-    return { path: target.path, anchor, reason: target.reason }
+    const hint = (text || '').trim() || baseNoExt(raw)
+    const target = this.resolve(key, { raw, text: hint, line: 0, wiki: false, image: false })
+    return { path: target.path, anchor, reason: target.reason, candidates: target.candidates }
   }
 
   /** N 跳邻域，只给摘要，不给全文 */

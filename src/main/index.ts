@@ -979,7 +979,9 @@ function setupIPC() {
   ipcMain.handle('links:broken', async () => linkIndex.broken())
   ipcMain.handle('links:stats', async () => linkIndex.statsNow())
   ipcMain.handle('links:graph', async (_e, rel: string, depth = 1) => linkIndex.neighborhood(rel, depth))
-  ipcMain.handle('links:resolve', async (_e, from: string, href: string) => linkIndex.resolveHref(from, href))
+  ipcMain.handle('links:resolve', async (_e, from: string, href: string, text?: string) =>
+    linkIndex.resolveHref(from, href, text)
+  )
   ipcMain.handle('links:index', async () => {
     await linkIndex.sync(true)
     return linkIndex.statsNow()

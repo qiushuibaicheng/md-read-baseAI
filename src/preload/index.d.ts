@@ -228,7 +228,11 @@ export interface InkAPI {
     rel: string,
     depth?: number
   ): Promise<{ path: string; title: string; summary: string; hop: number; dir: 'out' | 'in' }[]>
-  linksResolve(from: string, href: string): Promise<{ path: string | null; anchor?: string; reason: LinkReason }>
+  linksResolve(
+    from: string,
+    href: string,
+    text?: string
+  ): Promise<{ path: string | null; anchor?: string; reason: LinkReason; candidates?: string[] }>
   linksReindex(): Promise<LinkStats>
   onLinksChanged(cb: () => void): () => void
   saveSnippets(list: Snippet[]): Promise<boolean>

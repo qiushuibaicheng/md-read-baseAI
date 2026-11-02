@@ -10,7 +10,7 @@ interface Props {
   onToggleTask: (line: number) => void
   onSelectText: (text: string, rect: { x: number; y: number }) => void
   /** 点击库内文档链接 */
-  onDocLink?: (raw: string, anchor?: string) => void
+  onDocLink?: (raw: string, anchor?: string, text?: string) => void
 }
 
 export default function Preview({
@@ -83,7 +83,7 @@ export default function Preview({
       const docLink = anchor.getAttribute('data-doc-link')
       if (docLink) {
         e.preventDefault()
-        onDocLink?.(docLink, anchor.getAttribute('data-doc-anchor') || undefined)
+        onDocLink?.(docLink, anchor.getAttribute('data-doc-anchor') || undefined, anchor.textContent || undefined)
         return
       }
       const href = anchor.getAttribute('href') || ''
