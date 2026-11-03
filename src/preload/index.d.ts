@@ -242,10 +242,16 @@ export interface InkAPI {
       skipped: number
       paths: string[]
       failed?: string
+      /** 具体改了哪几行、从什么改成什么 */
+      changes?: { path: string; line: number; from: string; to: string }[]
+      /** 没能自动改写的几处，以及原因 */
+      skippedItems?: { path: string; line: number; raw: string; why: string }[]
     }) => void
   ): () => void
   /** 移动/改名后路径变了：旧路径 → 新路径 */
   onVaultMoved(cb: (info: { moves: Record<string, string> }) => void): () => void
+  /** 正文在磁盘上被改回了（撤销），界面据此重读 */
+  onVaultRefreshed(cb: (info: { paths: string[] }) => void): () => void
   historyInfo(reqId: string): Promise<{ count: number; labels: string[] }>
   historyUndo(reqId?: string): Promise<{
     ok: boolean
@@ -254,6 +260,8 @@ export interface InkAPI {
     skipped: number
     label: string
     note?: string
+    /** 正文被还原的文件（撤销后的路径） */
+    paths: string[]
   }>
   saveSnippets(list: Snippet[]): Promise<boolean>
   copyText(text: string): Promise<boolean>

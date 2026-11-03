@@ -9,6 +9,7 @@ import EditorGutter from './components/EditorGutter'
 import AiPanel, { type AiPanelHandle } from './components/AiPanel'
 import ModelsDialog from './components/ModelsDialog'
 import DiffDialog from './components/DiffDialog'
+import RelinkDialog, { type RelinkReport } from './components/RelinkDialog'
 import { Icon } from './components/Icons'
 import { renderMarkdown, exportStyles, relativeTime } from './lib/markdown'
 import type {
@@ -157,7 +158,7 @@ export default function App() {
     id: number
     msg: string
     bad?: boolean
-    action?: { label: string; run: () => void }
+    actions?: { label: string; run: () => void }[]
   } | null>(null)
   const [split, setSplit] = useState(0.5)
   const [dragging, setDragging] = useState(false)
@@ -169,6 +170,10 @@ export default function App() {
   const [undo, setUndo] = useState<{ path: string; content: string; at: number } | null>(null)
   /** AI 提交的修改提案，等待用户确认 */
   const [writes, setWrites] = useState<WriteProposal[]>([])
+  /** 最近一次移动/改名触发的链接改写明细 */
+  const [relink, setRelink] = useState<RelinkReport | null>(null)
+  const [relinkOpen, setRelinkOpen] = useState(false)
+  const relinkRef = useRef<{ at: number; from: string; count: number } | null>(null)
 
   const editorRef = useRef<HTMLTextAreaElement | null>(null)
   const panesRef = useRef<HTMLDivElement | null>(null)
@@ -236,6 +241,19 @@ export default function App() {
         })
         // 旧路径上还有没落盘的内容：写到新位置，别让它随旧路径一起消失
         arrived.forEach((p) => flushRef.current(p))
+      }),
+      // 撤销把正文改回原样了：编辑器里还是撤销前那份，重读一遍。
+      // 不重读的话，用户随手改一个字触发自动保存，旧内容（链接已失效）又写回磁盘。
+      window.api.onVaultRefreshed(async (info) => {
+        for (const p of info.paths) {
+          if (pending.current[p] !== undefined) continue
+          try {
+            const r = await window.api.readDoc(p)
+            setContents((c) => (p in c ? { ...c, [p]: r.content } : c))
+          } catch {
+            /* 文档可能已经不在了 */
+          }
+        }
       }),
       window.api.aiOnDocCreated(async () => {
         setDocs(await window.api.listDocs())
@@ -339,6 +357,24 @@ export default function App() {
 
   // ---------------------------------------------------------------- 链接图
   const [links, setLinks] = useState<DocLinks | null>(null)
+  /**
+   * 本文里按路径解析不到的链接。严格模式下「找不到」就是找不到，值得画出来。
+   * 注意编码差异：索引记的是文件里的原文，正文 <a> 的 href 已被 markdown-it
+   * 百分号编码过，两边都不解码就永远匹配不上。
+   */
+  const brokenRaw = useMemo(
+    () =>
+      new Set(
+        (links?.broken || []).map((e) => {
+          try {
+            return decodeURI(e.raw)
+          } catch {
+            return e.raw
+          }
+        })
+      ),
+    [links]
+  )
 
   useEffect(() => {
     if (!active) {
@@ -394,12 +430,15 @@ export default function App() {
     setOutlineId(null)
   }
 
-  const showToast = useCallback((msg: string, bad = false, action?: { label: string; run: () => void }) => {
-    setToast({ id: Date.now(), msg, bad, action })
-    if (toastTimer.current) clearTimeout(toastTimer.current)
-    // 带按钮的多留一会儿，否则还没反应过来就消失了
-    toastTimer.current = setTimeout(() => setToast(null), action ? 6000 : bad ? 2600 : 1700)
-  }, [])
+  const showToast = useCallback(
+    (msg: string, bad = false, actions?: { label: string; run: () => void }[]) => {
+      setToast({ id: Date.now(), msg, bad, actions })
+      if (toastTimer.current) clearTimeout(toastTimer.current)
+      // 带按钮的多留一会儿，否则还没反应过来就消失了
+      toastTimer.current = setTimeout(() => setToast(null), actions ? 6000 : bad ? 2600 : 1700)
+    },
+    []
+  )
 
   /** 撤回刚刚那一下结构操作（移动/改名/链接改写）；正文编辑仍走编辑器自己的 Ctrl+Z */
   const doUndo = useCallback(async () => {
@@ -415,7 +454,36 @@ export default function App() {
     )
   }, [showToast])
 
-  const undoAction = useCallback(() => ({ label: '撤销', run: () => void doUndo() }), [doUndo])
+  const undoAction = useCallback(() => [{ label: '撤销', run: () => void doUndo() }], [doUndo])
+
+  /**
+   * 移动成功后的提示。
+   *
+   * 移动几乎总会连带改写引用，而这些改写发生在别的文档里，用户看不到。
+   * 把「改了几处」并进同一条提示，并留一个「查看」入口——只报个数字
+   * 等于让他自己去全库找。
+   */
+  const moveToast = useCallback(
+    (msg: string, movedPath: string) => {
+      const r = relinkRef.current
+      if (r && r.from === movedPath && Date.now() - r.at < 8000) {
+        relinkRef.current = null
+        if (r.count > 0) {
+          showToast(`${msg} · 更新了 ${r.count} 处引用`, false, [
+            { label: '查看', run: () => setRelinkOpen(true) },
+            ...undoAction()
+          ])
+        } else {
+          showToast(`${msg} · 有引用没能自动改写`, true, [
+            { label: '查看', run: () => setRelinkOpen(true) }
+          ])
+        }
+        return
+      }
+      showToast(msg, false, undoAction())
+    },
+    [showToast, undoAction]
+  )
 
   // 移动/改名后主进程自动改写了链接：把受影响的文档重新读一遍，并交代改了多少处
   useEffect(
@@ -443,9 +511,27 @@ export default function App() {
             /* 文档可能刚被关掉 */
           }
         }
+        const report: RelinkReport = {
+          from: info.from,
+          count: info.count,
+          files: info.files,
+          changes: info.changes || [],
+          skippedItems: info.skippedItems || []
+        }
+        setRelink(report)
+        // 用户自己发起的移动随后会弹「已移动到…」，那条会覆盖这里；
+        // 先记下来，由 moveToast 把「改了几处」并进去，避免两边抢同一条提示
+        relinkRef.current = { at: Date.now(), from: info.from, count: info.count }
+        const view = { label: '查看', run: () => setRelinkOpen(true) }
         const held = info.paths.length - fresh.length
+        if (!info.count && info.skipped) {
+          showToast(`有 ${info.skipped} 处引用没能自动改写`, true, [view])
+          return
+        }
         showToast(
-          `已更新 ${info.count} 处链接` + (held ? `，${held} 篇有未保存内容待手动刷新` : '')
+          `已更新 ${info.count} 处引用` + (held ? `，${held} 篇有未保存内容待手动刷新` : ''),
+          false,
+          [view]
         )
       }),
     [dirty, tabs, showToast]
@@ -463,7 +549,8 @@ export default function App() {
             const cand = (res.candidates || []).slice(0, 3).join(' / ')
             showToast(`「${name}」对应多个文件，未跳转${cand ? `：${cand}` : ''}`, true)
           } else {
-            showToast(`「${name}」指向的文件不存在`, true)
+            // 只说「指向的文件不存在」用户拿不到原始地址，还得回正文里翻
+            showToast(`库里没有 ${linkLabel(raw)}`, true)
           }
           return
         }
@@ -530,7 +617,7 @@ export default function App() {
     const rel = await window.api.renameDoc(path, name)
     remapPaths(path, rel)
     setDocs(await window.api.listDocs())
-    showToast(`已重命名为「${name}」`, false, undoAction())
+    moveToast(`已重命名为「${name}」`, path)
   }
 
   const errText = (err: unknown) =>
@@ -588,7 +675,7 @@ export default function App() {
       if (res.rel !== payload.path) {
         remapPaths(payload.path, res.rel)
         const label = payload.targetDir ? `「${payload.targetDir.split('/').pop()}」` : '根目录'
-        showToast(payload.kind === 'dir' ? `文件夹已移到${label}` : `已移到${label}`, false, undoAction())
+        moveToast(payload.kind === 'dir' ? `文件夹已移到${label}` : `已移到${label}`, payload.path)
       }
       setConfig((c) => ({ ...c, order: res.order || {} }))
       setDocs(res.docs)
@@ -609,7 +696,7 @@ export default function App() {
       const rel = await window.api.moveDoc(path, dir)
       remapPaths(path, rel)
       setDocs(await window.api.listDocs())
-      showToast(dir ? `已移动到「${dir.split('/').pop()}」` : '已移到根目录', false, undoAction())
+      moveToast(dir ? `已移动到「${dir.split('/').pop()}」` : '已移到根目录', path)
     } catch (err) {
       showToast(errText(err), true)
     }
@@ -621,7 +708,7 @@ export default function App() {
       remapPaths(rel, next)
       setFolders(await window.api.listFolders())
       setDocs(await window.api.listDocs())
-      showToast(`文件夹已重命名为「${name}」`, false, undoAction())
+      moveToast(`文件夹已重命名为「${name}」`, rel)
     } catch (err) {
       showToast(errText(err), true)
     }
@@ -1461,6 +1548,7 @@ export default function App() {
                     fontSize={config.fontSize}
                     docKey={active}
                     theme={theme}
+                    broken={brokenRaw}
                     onCopy={copy}
                     onToggleTask={toggleTask}
                     onSelectText={(text, rect) => setSelection({ text, ...rect })}
@@ -1629,22 +1717,28 @@ export default function App() {
         onClose={() => setDiff(null)}
       />
 
+      <RelinkDialog
+        report={relinkOpen ? relink : null}
+        onUndo={() => void doUndo()}
+        onClose={() => setRelinkOpen(false)}
+      />
+
       {toast && (
         <div className={`toast${toast.bad ? ' is-bad' : ''}`} key={toast.id}>
           <Icon name={toast.bad ? 'alert' : 'check'} size={13} />
           <span className="toast-msg">{toast.msg}</span>
-          {toast.action && (
+          {toast.actions?.map((a) => (
             <button
+              key={a.label}
               className="toast-action"
               onClick={() => {
-                const run = toast.action?.run
                 setToast(null)
-                run?.()
+                a.run()
               }}
             >
-              {toast.action.label}
+              {a.label}
             </button>
-          )}
+          ))}
         </div>
       )}
     </div>

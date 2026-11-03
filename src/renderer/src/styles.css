@@ -4968,3 +4968,115 @@ button.backlink-row:hover {
 .folder-count:empty {
   display: none;
 }
+
+/* ==========================================================================
+   断链标记：索引已经算出来了，正文里就得看得出来
+   ========================================================================== */
+.markdown-body a[data-doc-link].is-broken {
+  color: var(--danger);
+  border-bottom: 1px dashed var(--danger);
+}
+.markdown-body a[data-doc-link].is-broken:hover {
+  border-bottom-style: solid;
+}
+
+/* ==========================================================================
+   自动改写明细
+   ========================================================================== */
+.relink-dialog {
+  width: min(720px, 92vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  border-radius: 15px;
+  border: 1px solid var(--line-strong);
+  background: var(--glass);
+  backdrop-filter: blur(26px) saturate(160%);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  animation: dialogIn 0.2s var(--ease);
+}
+.relink-stat {
+  color: var(--txt-3);
+}
+.relink-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 14px 14px;
+  user-select: text;
+}
+.relink-group {
+  margin-bottom: 12px;
+}
+.relink-group:last-child {
+  margin-bottom: 0;
+}
+.relink-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0 5px;
+  font-size: 11.5px;
+  font-weight: 550;
+  color: var(--txt-2);
+}
+.relink-file svg {
+  flex: 0 0 auto;
+  color: var(--txt-3);
+}
+.relink-file.is-warn,
+.relink-file.is-warn svg {
+  color: var(--danger);
+}
+.relink-count {
+  margin-left: auto;
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--txt-3);
+  font-family: var(--font-mono);
+}
+.relink-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 8px 3px 14px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+.relink-row:nth-child(odd) {
+  background: var(--panel-hover);
+}
+.relink-line {
+  flex: 0 0 auto;
+  min-width: 58px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--txt-3);
+}
+.relink-old,
+.relink-new {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  word-break: break-all;
+}
+.relink-old {
+  color: var(--txt-3);
+  text-decoration: line-through;
+  background: var(--panel-hover);
+}
+.relink-new {
+  color: var(--acc);
+  background: var(--acc-soft);
+}
+.relink-arrow {
+  flex: 0 0 auto;
+  color: var(--txt-3);
+}
+.relink-why {
+  font-size: 10.5px;
+  color: var(--txt-3);
+}

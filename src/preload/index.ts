@@ -40,10 +40,21 @@ const api = {
   linksReindex: () => ipcRenderer.invoke('links:index'),
   onLinksChanged: (cb: () => void) => on('links:changed', cb),
   onVaultRelinked: (
-    cb: (info: { from: string; count: number; files: number; skipped: number; paths: string[] }) => void
+    cb: (info: {
+      from: string
+      count: number
+      files: number
+      skipped: number
+      paths: string[]
+      failed?: string
+      changes?: { path: string; line: number; from: string; to: string }[]
+      skippedItems?: { path: string; line: number; raw: string; why: string }[]
+    }) => void
   ) => on('vault:relinked', cb),
   /** 移动/改名后通知界面把标签、正文缓存、待存队列一起搬过去 */
   onVaultMoved: (cb: (info: { moves: Record<string, string> }) => void) => on('vault:moved', cb),
+  /** 磁盘上的正文被改回了（撤销）：界面该重读这几个文件 */
+  onVaultRefreshed: (cb: (info: { paths: string[] }) => void) => on('vault:refreshed', cb),
   historyInfo: (reqId: string) => ipcRenderer.invoke('history:info', reqId),
   historyUndo: (reqId?: string) => ipcRenderer.invoke('history:undo', reqId),
   saveSnippets: (list: unknown) => ipcRenderer.invoke('snippets:save', list),

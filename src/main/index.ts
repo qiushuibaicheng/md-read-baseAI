@@ -402,13 +402,16 @@ async function relinkAfterMove(
   if (!moves.size) return null
   try {
     const out = await applyRelink(config.vaultPath, snapshot, moves)
-    if (out.applied.length) {
+    if (out.applied.length || out.skipped.length) {
       win?.webContents.send('vault:relinked', {
         from,
         count: out.applied.length,
         files: out.files,
         skipped: out.skipped.length,
-        paths: [...new Set(out.applied.map((c) => c.path))]
+        paths: [...new Set(out.applied.map((c) => c.path))],
+        // 明细给界面看：只报一个数字，用户没法判断「这 4 处改在我关心的文件上吗」
+        changes: out.applied.slice(0, 500),
+        skippedItems: out.skipped.slice(0, 200)
       })
     }
     return out
@@ -1141,6 +1144,9 @@ function setupIPC() {
     if (!res.ok) return res
     win?.webContents.send('vault:changed', await scanVault())
     win?.webContents.send('links:changed')
+    // 正文被改回原样了，编辑器里却还是撤销前的内容：不重读的话，用户随便改一个字
+    // 再自动保存，就把那份「链接已经失效」的旧文本又写回磁盘。
+    if (res.paths.length) win?.webContents.send('vault:refreshed', { paths: res.paths })
     return res
   })
 }

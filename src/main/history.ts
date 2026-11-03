@@ -61,6 +61,8 @@ export interface UndoResult {
   /** 给用户看的一句话 */
   label: string
   note?: string
+  /** 正文被改回原样的文件（撤销后的路径），界面据此重读，别让编辑器停在旧内容 */
+  paths: string[]
 }
 
 const MAX = 30
@@ -132,13 +134,15 @@ function backPath(p: string, moves: [string, string][]) {
   return p
 }
 
-async function undoEntry(e: Entry): Promise<{ restored: number; skipped: number; note?: string }> {
+async function undoEntry(
+  e: Entry
+): Promise<{ restored: number; skipped: number; note?: string; touched: string[] }> {
   if (e.kind === 'create') {
     try {
       await shell.trashItem(abs(e.path))
-      return { restored: 1, skipped: 0 }
+      return { restored: 1, skipped: 0, touched: [] }
     } catch {
-      return { restored: 0, skipped: 1, note: '新建的文档已经不在了' }
+      return { restored: 0, skipped: 1, note: '新建的文档已经不在了', touched: [] }
     }
   }
 
@@ -146,16 +150,19 @@ async function undoEntry(e: Entry): Promise<{ restored: number; skipped: number;
     try {
       const cur = await fsp.readFile(abs(e.path), 'utf8')
       // 撤销只回退「自己那一下」，之后又被改过就不动，绝不覆盖
-      if (cur !== e.after) return { restored: 0, skipped: 1, note: '文档之后又被改过，没有还原正文' }
+      if (cur !== e.after) {
+        return { restored: 0, skipped: 1, note: '文档之后又被改过，没有还原正文', touched: [] }
+      }
       await fsp.writeFile(abs(e.path), e.before, 'utf8')
-      return { restored: 1, skipped: 0 }
+      return { restored: 1, skipped: 0, touched: [e.path] }
     } catch {
-      return { restored: 0, skipped: 1, note: '文档已经不在了' }
+      return { restored: 0, skipped: 1, note: '文档已经不在了', touched: [] }
     }
   }
 
   let restored = 0
   let skipped = 0
+  const touched: string[] = []
 
   // 1. 先把文件挪回原位。原位置若被别的东西占了，就跳过而不是覆盖
   for (const [from, to] of [...e.moves].reverse()) {
@@ -178,6 +185,7 @@ async function undoEntry(e: Entry): Promise<{ restored: number; skipped: number;
       }
       await fsp.writeFile(abs(target), patch.before, 'utf8')
       restored++
+      touched.push(target)
     } catch {
       skipped++
     }
@@ -186,6 +194,7 @@ async function undoEntry(e: Entry): Promise<{ restored: number; skipped: number;
   return {
     restored,
     skipped,
+    touched,
     note: skipped ? '有部分文件之后被改过，只还原了位置' : undefined
   }
 }
@@ -202,11 +211,12 @@ export async function undoLast(reqId?: string): Promise<UndoResult> {
     targets.push(stack.length - 1)
   }
   if (!targets.length) {
-    return { ok: false, count: 0, restored: 0, skipped: 0, label: '' }
+    return { ok: false, count: 0, restored: 0, skipped: 0, label: '', paths: [] }
   }
 
   const entries = targets.map((i) => stack[i])
   const moves: [string, string][] = []
+  const touched: string[] = []
   let restored = 0
   let skipped = 0
   let note: string | undefined
@@ -215,6 +225,7 @@ export async function undoLast(reqId?: string): Promise<UndoResult> {
     const r = await undoEntry(e)
     restored += r.restored
     skipped += r.skipped
+    touched.push(...r.touched)
     if (r.note && !note) note = r.note
     if (e.kind === 'move') {
       for (const [from, to] of [...e.moves].reverse()) moves.push([to, from])
@@ -224,5 +235,13 @@ export async function undoLast(reqId?: string): Promise<UndoResult> {
   for (const i of [...targets].sort((a, b) => b - a)) stack.splice(i, 1)
   await notify(moves)
 
-  return { ok: true, count: entries.length, restored, skipped, label: entries[entries.length - 1].label, note }
+  return {
+    ok: true,
+    count: entries.length,
+    restored,
+    skipped,
+    label: entries[entries.length - 1].label,
+    note,
+    paths: [...new Set(touched)]
+  }
 }
