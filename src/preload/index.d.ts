@@ -226,6 +226,8 @@ export interface InkAPI {
   createDoc(payload: { dir?: string; title?: string }): Promise<string>
   renameDoc(rel: string, name: string): Promise<string>
   deleteDoc(rel: string): Promise<boolean>
+  /** 撤销删除：按原路径写回；位置被占用时加序号另存 */
+  restoreDeleted(rel: string): Promise<{ ok: true; path: string } | { ok: false }>
   importDoc(abs: string): Promise<string>
   revealDoc(rel: string): Promise<void>
   openDocExternal(rel: string): Promise<void>

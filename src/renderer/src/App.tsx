@@ -12,6 +12,7 @@ import DiffDialog from './components/DiffDialog'
 import RelinkDialog, { type RelinkReport } from './components/RelinkDialog'
 import { Icon } from './components/Icons'
 import { renderMarkdown, exportStyles, relativeTime } from './lib/markdown'
+import { isTypingTarget } from './lib/dom'
 import type {
   AppConfig,
   ClipItem,
@@ -682,15 +683,63 @@ export default function App() {
     }
   }
 
+  /** 让一个路径彻底从界面状态里消失：缓冲区、脏标记、待存内容、时间戳、定时器 */
+  const clearPathState = (path: string) => {
+    clearTimeout(saveTimers.current[path])
+    delete saveTimers.current[path]
+    delete pending.current[path]
+    delete mtimes.current[path]
+    setContents((c) => {
+      if (!(path in c)) return c
+      const next = { ...c }
+      delete next[path]
+      return next
+    })
+    setDirty((d) => {
+      if (!(path in d)) return d
+      const next = { ...d }
+      delete next[path]
+      return next
+    })
+    setUndo((u) => (u?.path === path ? null : u))
+    setWrites((ws) => ws.filter((w) => w.path !== path))
+  }
+
   const deleteDoc = async (path: string) => {
-    await window.api.deleteDoc(path)
+    // 先把没落盘的内容写下去：撤销恢复的是「你最后看到的那一版」。
+    // 顺带也避免待存内容在删除之后被自动保存写回来，文件又凭空出现。
+    if (pending.current[path] !== undefined) {
+      if (!(await flushSave(path))) return
+    }
+    try {
+      await window.api.deleteDoc(path)
+    } catch (err) {
+      showToast(errText(err), true)
+      return
+    }
+    const idx = tabs.indexOf(path)
+    clearPathState(path)
     setDocs((prev) => prev.filter((d) => d.path !== path))
     setTabs((prev) => {
       const next = prev.filter((p) => p !== path)
-      if (active === path) setActive(next[0] || null)
+      if (active === path) setActive(next[Math.max(0, idx - 1)] || null)
       return next
     })
-    showToast('已移到回收站')
+    showToast('已移到回收站', false, [{ label: '撤销', run: () => void undoDelete(path) }])
+  }
+
+  /** 撤销删除：主进程留着删除前的正文，按原路径写回；位置被占了就加序号另存 */
+  const undoDelete = async (path: string) => {
+    const res = await window.api.restoreDeleted(path)
+    if (!res.ok) {
+      showToast('这份已经恢复不了了', true)
+      return
+    }
+    const [list, dirs] = await Promise.all([window.api.listDocs(), window.api.listFolders()])
+    setDocs(list)
+    setFolders(dirs)
+    openDoc(res.path)
+    showToast(res.path === path ? '已恢复到原来的位置' : `已恢复到「${res.path.split('/').pop()}」`)
   }
 
   const renameDoc = async (path: string, name: string) => {
@@ -1239,8 +1288,10 @@ export default function App() {
         return
       }
       if (mod && key === 'z' && undo && undo.path === active && Date.now() - undo.at < 20000) {
-        const el = document.activeElement as HTMLElement | null
-        if (el && el.classList.contains('editor')) return
+        // 只接管「焦点不在可输入元素上」的 Ctrl+Z。
+        // 编辑器、AI 输入框、搜索框、重命名框里该撤的是用户自己刚打的字，
+        // 顺手把整篇退回到 AI 改之前，是最让人莫名其妙的一种「帮忙」。
+        if (isTypingTarget(document.activeElement)) return
         e.preventDefault()
         handleChange(undo.content)
         setUndo(null)
@@ -1776,15 +1827,37 @@ export default function App() {
           setModelsOpen(true)
         }}
         onPickVault={async () => {
-          const res = await window.api.pickVault()
-          if (res) {
-            setConfig(res.config)
-            setDocs(res.docs)
-      window.api.listFolders().then(setFolders).catch(() => undefined)
-            setTabs([])
-            setActive(null)
-            setContents({})
+          // 换库前先把旧库里没落盘的内容写回**旧库**。
+          // 不清 pending 就换，等于拿旧库的相对路径去新库写：同名文件直接被顶掉，
+          // 甚至凭空造出几个旧库才有的文件。
+          const saved = await Promise.all(Object.keys(pending.current).map((p) => flushRef.current(p)))
+          if (saved.some((ok) => !ok)) {
+            showToast('还有内容没保存成功，先处理一下再换库', true)
+            return
           }
+          const res = await window.api.pickVault()
+          if (!res) return
+
+          // 旧库的一切界面状态作废：定时器、待存内容、基准时间戳、缓冲区、脏标记
+          Object.values(saveTimers.current).forEach((t) => clearTimeout(t))
+          saveTimers.current = {}
+          pending.current = {}
+          mtimes.current = {}
+          titledRef.current.clear()
+          caretRef.current = null
+          prevActive.current = null
+          setDirty({})
+          setWrites([])
+          setUndo(null)
+          setSelection(null)
+          setLinks(null)
+
+          setConfig(res.config)
+          setDocs(res.docs)
+          window.api.listFolders().then(setFolders).catch(() => undefined)
+          setTabs([])
+          setActive(null)
+          setContents({})
         }}
         onOpenVault={() => window.api.openVault()}
         onQuit={() => window.api.quit()}

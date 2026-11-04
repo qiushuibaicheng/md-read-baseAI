@@ -632,6 +632,11 @@ let quitFlushed = false
 let flushWaiter: (() => void) | null = null
 /** 刚由界面写下的路径：监听回调要放过它们，别把「自己保存」当成「外部改动」 */
 const recentlyWritten = new Map<string, number>()
+/**
+ * 删掉的文档连同正文一起留一份。回收站没有跨平台还原接口，
+ * 想让「误点删除」能一键撤回，只能靠删之前把正文抄在内存里。
+ */
+const deletedStack: { path: string; content: string }[] = []
 
 function toggleWindow() {
   if (!win) return
@@ -997,11 +1002,42 @@ function setupIPC() {
 
   ipcMain.handle('doc:delete', async (_e, rel: string) => {
     const abs = safePath(rel)
+    // 删之前抄一份正文：撤销时按原路径写回去
+    const content = await fsp.readFile(abs, 'utf-8').catch(() => '')
     await shell.trashItem(abs)
+    if (content) {
+      deletedStack.unshift({ path: rel, content })
+      if (deletedStack.length > 20) deletedStack.pop()
+    }
     dropFromOrder(rel)
     linkIndex.invalidate(rel)
     win?.webContents.send('links:changed')
     return true
+  })
+
+  // 撤销删除：把快照写回原位置。原位置若已被占用，就加序号另存，绝不覆盖别人。
+  ipcMain.handle('doc:restoreDeleted', async (_e, rel: string) => {
+    const idx = deletedStack.findIndex((d) => d.path === rel)
+    if (idx < 0) return { ok: false as const }
+    const [item] = deletedStack.splice(idx, 1)
+
+    let abs = safePath(item.path)
+    if (existsSync(abs)) {
+      const dir = dirname(abs)
+      const stem = basename(abs).replace(/\.md$/i, '')
+      let n = 2
+      while (existsSync(join(dir, `${stem} ${n}.md`))) n++
+      abs = join(dir, `${stem} ${n}.md`)
+    }
+    await fsp.mkdir(dirname(abs), { recursive: true })
+    await fsp.writeFile(abs, item.content, 'utf-8')
+
+    const next = relative(config.vaultPath, abs).split('\\').join('/')
+    linkIndex.invalidate(next)
+    recentlyWritten.set(next, Date.now())
+    win?.webContents.send('vault:changed', await scanVault())
+    win?.webContents.send('links:changed')
+    return { ok: true as const, path: next }
   })
 
   ipcMain.handle('doc:import', async (_e, absPath: string) => {

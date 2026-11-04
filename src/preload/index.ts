@@ -30,6 +30,7 @@ const api = {
   createDoc: (payload: { dir?: string; title?: string }) => ipcRenderer.invoke('doc:create', payload),
   renameDoc: (rel: string, name: string) => ipcRenderer.invoke('doc:rename', rel, name),
   deleteDoc: (rel: string) => ipcRenderer.invoke('doc:delete', rel),
+  restoreDeleted: (rel: string) => ipcRenderer.invoke('doc:restoreDeleted', rel),
   importDoc: (abs: string) => ipcRenderer.invoke('doc:import', abs),
   revealDoc: (rel: string) => ipcRenderer.invoke('doc:reveal', rel),
   openDocExternal: (rel: string) => ipcRenderer.invoke('doc:openExternal', rel),
