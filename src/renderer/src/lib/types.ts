@@ -13,6 +13,8 @@ export interface AppConfig {
   openTabs: string[]
   windowWidth: number
   windowHeight: number
+  windowX?: number
+  windowY?: number
   autoLaunch: boolean
   aiModelId: string | null
   aiAutoTitle: boolean

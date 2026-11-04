@@ -53,6 +53,9 @@ interface Config {
   openTabs: string[]
   windowWidth: number
   windowHeight: number
+  /** 上次窗口左上角的位置；为空或不在任何屏幕里时退回居中 */
+  windowX?: number
+  windowY?: number
   autoLaunch: boolean
   aiModelId: string | null
   aiAutoTitle: boolean
@@ -68,7 +71,9 @@ interface Config {
 const defaultConfig = (): Config => ({
   vaultPath: join(app.getPath('documents'), 'Inkwell'),
   hotkey: DEFAULT_HOTKEY,
-  hideOnBlur: true,
+  // 默认不「一失焦就藏」：切到浏览器复制点东西窗口就消失，
+  // 是那种「用两次就不敢用」的默认值。想要悬浮窗行为的人在设置里打开。
+  hideOnBlur: false,
   alwaysOnTop: false,
   threeBg: true,
   clipboardWatch: true,
@@ -624,6 +629,8 @@ function startClipWatch() {
 // ---------------------------------------------------------------------------
 let win: BrowserWindow | null = null
 let tray: Tray | null = null
+/** 拖动窗口后延迟落盘位置 */
+let posTimer: NodeJS.Timeout | null = null
 let suppressBlurHide = false
 let isQuitting = false
 /** 退出流程是否已经等过一次落盘：防止 app.quit() 再次触发 before-quit 时又挂起 */
@@ -647,14 +654,46 @@ function toggleWindow() {
   showWindow()
 }
 
+/** 把当前窗口的位置与尺寸写回配置：下次唤起（或下次启动）回到原地 */
+function rememberBounds() {
+  if (!win || win.isDestroyed() || win.isMaximized() || win.isMinimized()) return
+  const b = win.getBounds()
+  config.windowX = b.x
+  config.windowY = b.y
+  config.windowWidth = b.width
+  config.windowHeight = b.height
+  saveConfig()
+}
+
 function showWindow() {
   if (!win) return
-  const cursor = screen.getCursorScreenPoint()
-  const display = screen.getDisplayNearestPoint(cursor)
-  const { x, y, width, height } = display.workArea
   const [w, h] = win.getSize()
-  const nx = Math.round(x + (width - w) / 2)
-  const ny = Math.round(y + Math.max(24, (height - h) * 0.32))
+  let nx = 0
+  let ny = 0
+  let placed = false
+
+  // 上次放在哪就还回哪：每次唤起都按鼠标所在屏居中，等于把用户摆好的位置当没看见
+  if (typeof config.windowX === 'number' && typeof config.windowY === 'number') {
+    const bx = config.windowX
+    const by = config.windowY
+    // 只认可「还露在某个屏幕里」的位置：显示器拔掉或分辨率变了就别硬塞到屏幕外
+    placed = screen.getAllDisplays().some((d) => {
+      const a = d.workArea
+      return bx < a.x + a.width - 80 && bx + w > a.x + 80 && by < a.y + a.height - 60 && by + h > a.y + 40
+    })
+    if (placed) {
+      nx = bx
+      ny = by
+    }
+  }
+
+  if (!placed) {
+    const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+    const { x, y, width, height } = display.workArea
+    nx = Math.round(x + (width - w) / 2)
+    ny = Math.round(y + Math.max(24, (height - h) * 0.32))
+  }
+
   win.setPosition(nx, ny)
   win.show()
   win.focus()
@@ -715,6 +754,17 @@ function createWindow() {
     config.windowHeight = h
     saveConfig()
   })
+
+  win.on('moved', () => {
+    if (!win || win.isMaximized() || win.isMinimized()) return
+    // 拖动过程中会连续触发，等停稳再落盘
+    if (posTimer) clearTimeout(posTimer)
+    posTimer = setTimeout(rememberBounds, 400)
+  })
+
+  // 有些移动方式（程序化 setPosition、贴边吸附）不一定会发 moved，
+  // 收起窗口和退出前各补一次，保证「下次还在原位」这件事不看运气
+  win.on('hide', rememberBounds)
 
   win.on('maximize', () => win?.webContents.send('window:maximized', true))
   win.on('unmaximize', () => win?.webContents.send('window:maximized', false))
@@ -962,7 +1012,10 @@ function setupIPC() {
     const base = payload.title?.trim() || `未命名 ${stamp.getMonth() + 1}-${pad(stamp.getDate())} ${pad(stamp.getHours())}${pad(stamp.getMinutes())}`
     const name = uniqueName(dirAbs, base)
     const abs = join(dirAbs, name)
-    await fsp.writeFile(abs, `# ${payload.title?.trim() || '未命名文档'}\n\n`, 'utf-8')
+    // 标题跟文件名走：以前固定写「# 未命名文档」，连开三篇侧栏就是三行一模一样的字，
+    // 只能用副标题里的时间区分。仍然以「未命名」开头，AI 自动命名照样认得。
+    const heading = payload.title?.trim() || name.replace(/\.md$/i, '')
+    await fsp.writeFile(abs, `# ${heading}\n\n`, 'utf-8')
     const rel = relative(config.vaultPath, abs).split('\\').join('/')
     unshiftOrder(payload.dir || '', rel)
     linkIndex.invalidate(rel)
@@ -1434,6 +1487,8 @@ if (!gotLock) {
 
   app.on('before-quit', (e) => {
     isQuitting = true
+    // 退出前把窗口位置记下来，下次启动就在原地
+    rememberBounds()
     // 自动保存有 600ms 窗口：打完最后一句话直接「退出」，这段话还没落盘。
     // 先让渲染层把 pending 写完再退；窗口已经没了就直接走。
     if (quitFlushed || !win || win.webContents.isDestroyed()) return

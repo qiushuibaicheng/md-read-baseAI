@@ -8,7 +8,9 @@ const BUDGET_STEPS = [8000, 16000, 32000, 64000, 128000]
 const fmtK = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
 
 const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
-const MAX_HISTORY = 12
+const MAX_HISTORY = 60
+/** 超过这个数量才提示「早期对话已省略」。按预算折叠是主进程那一层的事，这里只防无限增长 */
+const HISTORY_NOTE_AT = 60
 
 function parseArgs(raw?: string): Record<string, any> {
   try {
@@ -80,7 +82,7 @@ interface Props {
   onReplaceDoc: (text: string) => void
   onNewDoc: (title: string, content: string) => void
   onCopy: (text: string, label?: string) => void
-  onToast: (msg: string) => void
+  onToast: (msg: string, bad?: boolean, actions?: { label: string; run: () => void }[]) => void
   /** 读取编辑器当前光标（path 与字符偏移），用于把「光标在哪」告诉模型 */
   readCaret?: () => { path: string | null; start: number }
 }
@@ -148,7 +150,6 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
   const listRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
   const pending = useRef<Map<string, { sessionId: string; messageId: string }>>(new Map())
-  const contentCache = useRef<Map<string, string>>(new Map())
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const stickBottom = useRef(true)
 
@@ -170,6 +171,28 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
   const persist = useCallback((next: AiSession[]) => {
     if (saveTimer.current) clearTimeout(saveTimer.current)
     saveTimer.current = setTimeout(() => window.api.aiSaveSessions(next), 500)
+  }, [])
+
+  /**
+   * 文档改名/移动后，会话里记的路径也得跟着走。
+   * 不搬的话，界面上「上下文 2」还亮着，发出去的请求里却只剩一篇——
+   * 因为读不到的那篇会被静默跳过。
+   */
+  useEffect(() => {
+    return window.api.onVaultMoved((info) => {
+      const moves = info.moves || {}
+      if (!Object.keys(moves).length) return
+      setSessions((prev) =>
+        prev.map((s) => {
+          const ctx = s.contextPaths || []
+          const nextCtx = ctx.map((p) => moves[p] || p)
+          const nextDoc = s.docPath && moves[s.docPath] ? moves[s.docPath] : s.docPath
+          const sameCtx = nextCtx.length === ctx.length && nextCtx.every((p, i) => p === ctx[i])
+          if (sameCtx && nextDoc === s.docPath) return s
+          return { ...s, contextPaths: nextCtx, docPath: nextDoc }
+        })
+      )
+    })
   }, [])
 
   const mutateSession = useCallback(
@@ -230,37 +253,36 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
     [session, setContextPaths]
   )
 
-  const loadDocList = useCallback(async () => {
-    const list = await window.api.listDocs()
-    setDocList(list)
-    return list
-  }, [])
-
   const openPicker = useCallback(async () => {
     setCtxOpen(true)
     setCtxQuery('')
-    if (!docList.length) await loadDocList()
-  }, [docList.length, loadDocList])
+    // 每次打开都重读：用户可能刚新建、改名或移动过文档，
+    // 只加载一次的话，新文档在列表里根本不存在。
+    setDocList(await window.api.listDocs())
+  }, [])
 
-  /** 读取选中文档的正文（带缓存，避免每轮重复读盘） */
-  const readContextFiles = useCallback(async (paths: string[]) => {
-    const out: { path: string; title: string; content: string }[] = []
-    for (const p of paths) {
-      let content = contentCache.current.get(p)
-      if (content === undefined) {
+  /**
+   * 读取选中文档的正文。
+   * 不复用缓存：这几篇是「别处的文档」，用户可能正在编辑器或别的应用里改它，
+   * 缓存里那份一旦过期，AI 就会拿着一份旧内容回答，而界面还显示「已带入」。
+   * 发送是用户动作，一次读几篇的代价完全可以接受。
+   */
+  const readContextFiles = useCallback(
+    async (paths: string[]) => {
+      const out: { path: string; title: string; content: string }[] = []
+      for (const p of paths) {
         try {
           const res = await window.api.readDoc(p)
-          content = res.content
-          contentCache.current.set(p, content)
+          const meta = docList.find((d) => d.path === p)
+          out.push({ path: p, title: meta?.title || p.split('/').pop() || p, content: res.content })
         } catch {
-          continue
+          // 文件已经不在了：跳过，但别让整次请求失败
         }
       }
-      const meta = docList.find((d) => d.path === p)
-      out.push({ path: p, title: meta?.title || p.split('/').pop() || p, content })
-    }
-    return out
-  }, [docList])
+      return out
+    },
+    [docList]
+  )
 
   // ---------------------------------------------------------------- 流式事件
   const scrollToBottom = useCallback(() => {
@@ -430,13 +452,20 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
       stickBottom.current = true
       requestAnimationFrame(scrollToBottom)
 
-      const history = current.messages
-        .filter((m) => m.content.trim() && !m.error)
-        .slice(-MAX_HISTORY)
-        .map((m) => ({ role: m.role, content: m.content }))
+      // 历史交给主进程按 token 预算折叠：这里只防无限增长，
+      // 原先的 12 条大约是 6 轮，聊到第 7 轮 AI 就静悄悄忘了前面说过什么。
+      const usable = current.messages.filter((m) => m.content.trim() && !m.error)
+      const trimmed = usable.length > MAX_HISTORY
+      const history = (trimmed ? usable.slice(-MAX_HISTORY) : usable).map((m) => ({ role: m.role, content: m.content }))
+      if (trimmed) setToolNote(`对话较长，这次只带最近 ${HISTORY_NOTE_AT} 条，更早的没有进上下文`)
 
       try {
         const picked = await readContextFiles(contextPaths)
+        // 读不到的别装作带上了：界面上的「上下文 N」和真正发出去的内容必须一致
+        const missing = contextPaths.filter((p) => p !== docPath && !picked.some((f) => f.path === p))
+        if (missing.length) {
+          setToolNote(`${missing.length} 篇上下文读不到了（可能已删除）：${missing.slice(0, 2).join('、')}`)
+        }
         if (attachDoc && docContent) {
           const idx = picked.findIndex((f) => f.path === docPath)
           const self = { path: docPath || docTitle || '当前文档', title: docTitle || '当前文档', content: docContent }
@@ -548,11 +577,26 @@ export default forwardRef<AiPanelHandle, Props>(function AiPanel(props, ref) {
   }
 
   const removeSession = (id: string) => {
-    setSessions((prev) => {
-      const next = prev.filter((s) => s.id !== id)
-      if (sessionId === id) setSessionId(next[0]?.id || null)
-      return next
-    })
+    const idx = sessions.findIndex((s) => s.id === id)
+    const target = sessions[idx]
+    if (!target) return
+    const next = sessions.filter((s) => s.id !== id)
+    setSessions(next)
+    if (sessionId === id) setSessionId(next[0]?.id || null)
+    // 删掉的是整段对话，不像文档那样有磁盘副本可退：给一次撤销的机会
+    onToast(`已删除对话「${target.title}」`, false, [
+      {
+        label: '撤销',
+        run: () => {
+          setSessions((prev) => {
+            const out = prev.slice()
+            out.splice(Math.min(idx, out.length), 0, target)
+            return out
+          })
+          setSessionId(target.id)
+        }
+      }
+    ])
   }
 
   // ---------------------------------------------------------------- 拖拽宽度

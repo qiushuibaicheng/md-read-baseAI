@@ -180,6 +180,18 @@ export default function App() {
   const panesRef = useRef<HTMLDivElement | null>(null)
   /** 最后一次已知的插入点：切到 AI 面板后 textarea 失焦，但位置要留住 */
   const caretRef = useRef<{ path: string; start: number; end: number } | null>(null)
+  /**
+   * 每篇文档自己的滚动位置与选区。
+   * 全应用只有一个 textarea，换文档时 value 一换，光标就掉到文末、
+   * 滚动位置也没有记忆——从一篇长文切到另一篇，落点完全靠运气。
+   */
+  const viewRef = useRef<Map<string, { scroll: number; start: number; end: number }>>(new Map())
+  /** 已经为该文档恢复过视图状态，避免每敲一个字都重置光标 */
+  const restoredFor = useRef<string | null>(null)
+  /** 待执行的行跳转（搜索命中行）：内容读进来之后再落光标 */
+  const jumpRef = useRef<{ path: string; line: number } | null>(null)
+  /** 同一篇文档内再次跳行时，active 不变也要触发一次 */
+  const [jumpTick, setJumpTick] = useState(0)
   const saveTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
   const pending = useRef<Record<string, string>>({})
   /** 最近一次读/写时磁盘上的 mtime：保存前拿它比对，能发现「别处改过」 */
@@ -421,6 +433,63 @@ export default function App() {
     prevActive.current = active
   }, [active, flushSave])
 
+  /**
+   * 换文档时把这篇上次的滚动位置和光标放回去。
+   * 内容还没读进来就等它（依赖 contents），读进来后只恢复一次——
+   * restoredFor 挡住后续每次输入触发的重跑，否则打字时会被拽回原点。
+   */
+  useEffect(() => {
+    if (!active || restoredFor.current === active) return
+    if (contents[active] === undefined) return
+    const ta = editorRef.current
+    if (!ta) return
+    // 有行跳转任务时交给下面那个 effect，两边都设光标会互相打架
+    if (jumpRef.current?.path === active) return
+    restoredFor.current = active
+    const want = viewRef.current.get(active)
+    const pos = Math.min(want?.start ?? 0, ta.value.length)
+    const end = Math.min(want?.end ?? pos, ta.value.length)
+    requestAnimationFrame(() => {
+      ta.setSelectionRange(pos, end)
+      ta.scrollTop = want?.scroll ?? 0
+      caretRef.current = { path: active, start: pos, end }
+    })
+  }, [active, contents])
+
+  /**
+   * 搜索点进来时落到命中行。
+   * 原先只 openDoc(path)，光标在文首——「搜索结果写着第 400 行，点进去还在第 1 行」。
+   */
+  useEffect(() => {
+    const job = jumpRef.current
+    if (!job || job.path !== active) return
+    if (contents[active] === undefined) return
+    const ta = editorRef.current
+    jumpRef.current = null
+    restoredFor.current = active
+    if (!ta) return
+    const lines = ta.value.split('\n')
+    const line = Math.min(Math.max(0, job.line - 1), lines.length - 1)
+    let idx = 0
+    for (let i = 0; i < line; i++) idx += lines[i].length + 1
+    const end = idx + (lines[line]?.length || 0)
+    requestAnimationFrame(() => {
+      ta.focus()
+      ta.setSelectionRange(idx, end)
+      const cs = getComputedStyle(ta)
+      const lh = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.8
+      const padTop = parseFloat(cs.paddingTop) || 0
+      ta.scrollTop = Math.max(0, padTop + line * lh - ta.clientHeight / 3)
+      caretRef.current = { path: active, start: idx, end }
+      viewRef.current.set(active, { scroll: ta.scrollTop, start: idx, end })
+      // 预览模式（或分栏的右半边）也滚到大致位置，否则点完看不出变化
+      const scroller = document.querySelector('.preview') as HTMLElement | null
+      if (scroller && lines.length > 1) {
+        scroller.scrollTop = Math.max(0, (line / (lines.length - 1)) * scroller.scrollHeight - scroller.clientHeight / 3)
+      }
+    })
+  }, [active, contents, jumpTick])
+
   useEffect(() => {
     const onBlur = () => Object.keys(pending.current).forEach((p) => void flushSave(p))
     window.addEventListener('blur', onBlur)
@@ -503,13 +572,25 @@ export default function App() {
   /** 点预览里的库内链接：交给主进程解析，再跳过去 */
 
   // ---------------------------------------------------------------- 文档操作
-  const openDoc = (path: string) => {
-    setTabs((t) => (t.includes(path) ? t : [...t, path].slice(-9)))
+  const openDoc = (path: string, jumpLine?: number) => {
+    // 不设上限：标签栏本来就能横向滚动，硬截断只会让最早那篇
+    // 在你开第 10 篇时悄无声息地消失
+    setTabs((t) => (t.includes(path) ? t : [...t, path]))
     setActive(path)
     setView('notes')
     setSelection(null)
     setOutlineId(null)
+    if (jumpLine && jumpLine > 0) {
+      jumpRef.current = { path, line: jumpLine }
+      setJumpTick((t) => t + 1)
+    }
   }
+
+  /** 标签多了要能看见当前这篇：把它滚进可视区 */
+  useEffect(() => {
+    const el = document.querySelector('.tab.is-active') as HTMLElement | null
+    el?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }, [active, tabs.length])
 
   const showToast = useCallback(
     (msg: string, bad = false, actions?: { label: string; run: () => void }[]) => {
@@ -799,6 +880,10 @@ export default function App() {
     })
     setActive((a) => (a ? map(a) : a))
     if (caretRef.current) caretRef.current.path = map(caretRef.current.path)
+    // 滚动位置/选区也按新路径收好，否则切回来会落到文首
+    const nextView = new Map<string, { scroll: number; start: number; end: number }>()
+    viewRef.current.forEach((v, k) => nextView.set(map(k), v))
+    viewRef.current = nextView
     setWrites((list) => list.map((w) => (map(w.path) === w.path ? w : { ...w, path: map(w.path) })))
     setUndo((u) => (u && map(u.path) !== u.path ? { ...u, path: map(u.path) } : u))
     return arrived
@@ -1127,11 +1212,12 @@ export default function App() {
     showToast('已追加到文末')
   }
 
-  /** 记住光标：点击、拖选、键盘移动都要更新 */
+  /** 记住光标与滚动位置：点击、拖选、键盘移动、滚动都要更新 */
   const rememberCaret = () => {
     const ta = editorRef.current
     if (!ta || !active) return
     caretRef.current = { path: active, start: ta.selectionStart, end: ta.selectionEnd }
+    viewRef.current.set(active, { scroll: ta.scrollTop, start: ta.selectionStart, end: ta.selectionEnd })
   }
 
   /**
@@ -1321,12 +1407,15 @@ export default function App() {
         else if (diff) setDiff(null)
         else if (settingsOpen) setSettingsOpen(false)
         else if (outlineOpen) setOutlineOpen(false)
+        // AI 面板开着的时候，Esc 先收面板——直接连窗口一起藏起来，
+        // 会让人以为「按了下 Esc，应用没了」
+        else if (aiOpen) setAiOpen(false)
         else window.api.hide()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [active, mode, searchOpen, settingsOpen, outlineOpen, snippets, flushSave, selection, modelsOpen, diff, undo])
+  }, [active, mode, searchOpen, settingsOpen, outlineOpen, snippets, flushSave, selection, modelsOpen, diff, undo, aiOpen])
 
   // ---------------------------------------------------------------- 编辑交互
   const onEditorKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1688,6 +1777,7 @@ export default function App() {
                       onKeyUp={rememberCaret}
                       onMouseUp={rememberCaret}
                       onSelect={rememberCaret}
+                      onScroll={rememberCaret}
                       onFocus={rememberCaret}
                       onPaste={onPaste}
                       placeholder="开始记录…"

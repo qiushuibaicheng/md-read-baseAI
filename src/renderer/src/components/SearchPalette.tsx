@@ -7,7 +7,8 @@ interface Props {
   open: boolean
   docs: DocMeta[]
   onClose: () => void
-  onOpen: (path: string) => void
+  /** line：命中行（1 起），给了就顺带把光标滚到那一行 */
+  onOpen: (path: string, line?: number) => void
   onNew: () => void
   onAsk: (query: string, results: SearchResult[]) => void
 }
@@ -18,6 +19,8 @@ export default function SearchPalette({ open, docs, onClose, onOpen, onNew, onAs
   const [cursor, setCursor] = useState(0)
   const [busy, setBusy] = useState(false)
   const inputRef = useRef<HTMLInputElement | null>(null)
+  /** 请求序号：慢的旧请求回来时不能覆盖新结果 */
+  const seq = useRef(0)
 
   useEffect(() => {
     if (!open) return
@@ -36,9 +39,12 @@ export default function SearchPalette({ open, docs, onClose, onOpen, onNew, onAs
       setBusy(false)
       return
     }
+    const mine = ++seq.current
     setBusy(true)
     const timer = setTimeout(async () => {
       const res = await window.api.search(q)
+      // 迟到的旧请求：直接丢弃，否则结果会「跳回上一个词」
+      if (mine !== seq.current) return
       setResults(res)
       setCursor(0)
       setBusy(false)
@@ -53,10 +59,17 @@ export default function SearchPalette({ open, docs, onClose, onOpen, onNew, onAs
     return results
   }, [query, results, recents])
 
-  const choose = (path: string | undefined) => {
+  const choose = (path: string | undefined, line?: number) => {
     if (!path) return
-    onOpen(path)
+    onOpen(path, line)
     onClose()
+  }
+
+  /** 回车打开当前选中项：有命中就落到第一条命中行 */
+  const openCursor = () => {
+    const item = flat[cursor]
+    if (!item) return
+    choose(item.path, item.hits?.[0]?.line)
   }
 
   if (!open) return null
@@ -80,7 +93,7 @@ export default function SearchPalette({ open, docs, onClose, onOpen, onNew, onAs
                 setCursor((c) => Math.max(0, c - 1))
               } else if (e.key === 'Enter') {
                 e.preventDefault()
-                choose(flat[cursor]?.path)
+                openCursor()
               } else if (e.key === 'Tab') {
                 e.preventDefault()
                 if (query.trim()) onAsk(query.trim(), results)
@@ -138,13 +151,25 @@ export default function SearchPalette({ open, docs, onClose, onOpen, onNew, onAs
                 key={r.path}
                 className={`palette-row tall${cursor === i ? ' is-active' : ''}`}
                 onMouseEnter={() => setCursor(i)}
-                onClick={() => choose(r.path)}
+                onClick={() => choose(r.path, r.hits[0]?.line)}
               >
                 <Icon name="doc" size={15} />
                 <span className="palette-result">
                   <span className="palette-title">{highlightTextJsx(r.title, query.trim())}</span>
                   {r.hits.map((h) => (
-                    <span className="palette-hit" key={h.line}>
+                    <span
+                      className="palette-hit"
+                      key={h.line}
+                      role="button"
+                      title={`跳到第 ${h.line} 行`}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        // 行本身是按钮，这里要拦下来，否则会走「打开文档开头」
+                        e.stopPropagation()
+                        e.preventDefault()
+                        choose(r.path, h.line)
+                      }}
+                    >
                       <span className="hit-line">{h.line}</span>
                       <span dangerouslySetInnerHTML={{ __html: highlightText(h.text, query.trim()) }} />
                     </span>
