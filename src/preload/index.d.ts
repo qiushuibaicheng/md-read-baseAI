@@ -281,7 +281,8 @@ export interface InkAPI {
   clipboardHistory(): Promise<ClipItem[]>
   clearClipboard(): Promise<ClipItem[]>
   removeClipboard(id: string): Promise<ClipItem[]>
-  saveAsset(name: string, dataUrl: string): Promise<string>
+  /** 保存粘贴的图片，放在这篇文档旁边的 assets/，返回相对该文档的写法 */
+  saveAsset(name: string, dataUrl: string, doc?: string): Promise<string>
   exportHTML(name: string, html: string): Promise<string | null>
   openExternal(url: string): Promise<void>
   aiModels(): Promise<ModelProfile[]>

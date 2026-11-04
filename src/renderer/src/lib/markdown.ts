@@ -114,14 +114,51 @@ md.renderer.rules.list_item_open = (tokens, idx, options, env, self) => {
   return self.renderToken(tokens, idx, options)
 }
 
+/** 去掉 `.` 与 `..` 段，得到库内相对路径 */
+function normalizeRel(p: string): string {
+  const parts: string[] = []
+  for (const seg of p.split('/')) {
+    if (!seg || seg === '.') continue
+    if (seg === '..') parts.pop()
+    else parts.push(seg)
+  }
+  return parts.join('/')
+}
+
+/**
+ * 解析正文里的本地图片：相对**这篇文档所在目录**，`/` 开头算库根。
+ * 这是 Typora / Obsidian / VSCode 共同的语义，写成这样就到哪儿都能显示。
+ *
+ * 老版本把它一律按库根拼（`assets/x.png` 指库根的 assets），历史上存下来的
+ * 正文都是那种写法，所以额外带一个「库根」候选，主进程在第一个不存在时再试它。
+ */
+function assetUrl(vaultPath: string, docPath: string, raw: string): string {
+  let clean = raw
+  try {
+    clean = decodeURI(clean)
+  } catch {
+    /* 编码不合法就按原文处理 */
+  }
+
+  const root = vaultPath.replace(/[\\/]+$/, '')
+  const toAbs = (rel: string) => `${root}\\${rel.replace(/\//g, '\\')}`
+  const docDir = docPath.includes('/') ? docPath.slice(0, docPath.lastIndexOf('/')) : ''
+
+  const primary = clean.startsWith('/') ? normalizeRel(clean.slice(1)) : normalizeRel(`${docDir}/${clean}`)
+  const fallback = normalizeRel(clean)
+
+  const one = toAbs(primary)
+  const two = toAbs(fallback)
+  const query = one === two ? `p=${encodeURIComponent(one)}` : `p=${encodeURIComponent(one)}&r=${encodeURIComponent(two)}`
+  return `ink-asset://local/?${query}`
+}
+
 // 本地图片 => ink-asset 协议
 md.renderer.rules.image = (tokens, idx, options, env, self) => {
   const token = tokens[idx]
   const raw = token.attrGet('src') || ''
   if (!/^(https?:|data:|ink-asset:|blob:)/i.test(raw) && env?.vaultPath) {
-    const cleaned = decodeURI(raw.replace(/^\.\//, ''))
-    const abs = `${String(env.vaultPath).replace(/[\\/]+$/, '')}\\${cleaned.replace(/\//g, '\\')}`
-    token.attrSet('src', `ink-asset://local/?p=${encodeURIComponent(abs)}`)
+    token.attrSet('src', assetUrl(String(env.vaultPath), String(env.docPath || ''), raw))
   }
   token.attrSet('loading', 'lazy')
   return self.renderToken(tokens, idx, options)
@@ -153,8 +190,8 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
   return self.renderToken(tokens, idx, options)
 }
 
-export function renderMarkdown(source: string, vaultPath: string): RenderResult {
-  const env: Record<string, unknown> = { vaultPath }
+export function renderMarkdown(source: string, vaultPath: string, docPath = ''): RenderResult {
+  const env: Record<string, unknown> = { vaultPath, docPath }
   const tokens = md.parse(source, env)
   const headings: Heading[] = []
   tokens.forEach((t, i) => {

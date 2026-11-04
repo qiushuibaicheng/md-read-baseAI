@@ -21,7 +21,7 @@ import * as fsp from 'fs/promises'
 import { pathToFileURL } from 'url'
 import { registerAi, shutdownAi } from './ai'
 import { LinkIndex } from './links'
-import type { InboundEdge } from './links'
+import type { MoveSnapshot } from './links'
 import { applyRelink } from './relink'
 import type { RelinkOutcome } from './relink'
 import { initHistory, recordCreate, recordMove, undoLast, infoFor } from './history'
@@ -395,7 +395,7 @@ function dropFromOrder(rel: string) {
  * 改写失败不让移动本身失败——文件已经挪好了，链接问题可以在设置页的失效清单里看到。
  */
 async function relinkAfterMove(
-  snapshot: Map<string, InboundEdge[]>,
+  snapshot: MoveSnapshot,
   moves: Map<string, string>,
   from: string
 ): Promise<RelinkOutcome | null> {
@@ -438,7 +438,7 @@ async function moveDocTo(rel: string, targetDir: string): Promise<string> {
   const dest = join(destDir, basename(abs))
   if (resolve(dest) === resolve(abs)) return rel
   if (existsSync(dest)) throw new Error('目标文件夹里已有同名文件')
-  const snapshot = await linkIndex.snapshotInbound()
+  const snapshot = await linkIndex.snapshotForMove()
   await fsp.rename(abs, dest)
   const next = relOf(dest)
   const out = await relinkAfterMove(snapshot, new Map([[rel, next]]), rel)
@@ -461,7 +461,7 @@ async function moveFolderTo(rel: string, targetDir: string): Promise<string> {
   if (resolve(dest) === resolve(abs)) return rel
   if (existsSync(dest)) throw new Error(`目标位置已有同名文件夹「${name}」`)
   // 快照与内部文档清单都得在被挪走之前拿：挪完旧路径就查不到了
-  const snapshot = await linkIndex.snapshotInbound()
+  const snapshot = await linkIndex.snapshotForMove()
   const inner = (await linkIndex.list())
     .map((d) => d.path)
     .filter((p) => p.startsWith(`${rel}/`))
@@ -536,7 +536,7 @@ async function moveEntryAny(from: string, toDir: string, newName?: string, reqId
 
   // 移动会改变相对链接的基准，而 AI 的 move_entry 也走这里：
   // 入链快照必须在 rename 之前取，挪完旧路径就解析不到，边会退化成断链。
-  const snapshot = await linkIndex.snapshotInbound()
+  const snapshot = await linkIndex.snapshotForMove()
   const innerDocs = isDir
     ? (await linkIndex.list())
         .map((d) => d.path)
@@ -982,7 +982,7 @@ function setupIPC() {
       throw new Error(`已存在「${basename(nextAbs)}」，换个名字或先把它移走`)
     }
 
-    const snapshot = await linkIndex.snapshotInbound()
+    const snapshot = await linkIndex.snapshotForMove()
     await fsp.rename(abs, nextAbs)
     const next = relative(config.vaultPath, nextAbs).split('\\').join('/')
     const out = await relinkAfterMove(snapshot, new Map([[rel, next]]), rel)
@@ -1073,7 +1073,7 @@ function setupIPC() {
     if (existsSync(dest)) throw new Error(`「${clean}」已存在`)
     // 改名会改变所有内部文档的路径基准：外部指进来的链接必须跟着改写，
     // 否则一改名就静默断链（内部互链的相对关系不变，所以从界面看不出来）。
-    const snapshot = await linkIndex.snapshotInbound()
+    const snapshot = await linkIndex.snapshotForMove()
     const inner = (await linkIndex.list())
       .map((d) => d.path)
       .filter((p) => p.startsWith(`${from}/`))
@@ -1141,14 +1141,18 @@ function setupIPC() {
 
   ipcMain.handle('clipboard:history', () => clipHistory)
 
-  ipcMain.handle('asset:save', async (_e, payload: { name: string; dataUrl: string }) => {
+  ipcMain.handle('asset:save', async (_e, payload: { name: string; dataUrl: string; doc?: string }) => {
     const match = payload.dataUrl.match(/^data:(image\/[a-zA-Z+]+);base64,(.*)$/)
     if (!match) throw new Error('不支持的图片格式')
     const ext = match[1].split('/')[1].replace('jpeg', 'jpg').replace('svg+xml', 'svg')
-    const dir = join(config.vaultPath, 'assets')
+    // 存到文档自己旁边的 assets/：图片路径在 Markdown 里是相对文档目录的，
+    // 统一堆到库根的话，子目录里的文档换到 Typora/VSCode 打开就成了裂图。
+    const docDir = payload.doc && payload.doc.includes('/') ? payload.doc.slice(0, payload.doc.lastIndexOf('/')) : ''
+    const dir = docDir ? join(config.vaultPath, docDir, 'assets') : join(config.vaultPath, 'assets')
     ensureDir(dir)
     const file = `paste-${Date.now()}.${ext}`
     await fsp.writeFile(join(dir, file), Buffer.from(match[2], 'base64'))
+    // 返回的是「相对这篇文档」的写法，和放的位置一致
     return `assets/${file}`
   })
 
@@ -1164,14 +1168,22 @@ function setupIPC() {
     if (res.canceled || !res.filePath) return null
     let html = payload.html
     // 把本地图片内联成 base64，导出的单文件才能独立打开
-    const refs = [...html.matchAll(/ink-asset:\/\/local\/\?p=([^"'\s)]+)/g)]
+    const seen = new Set<string>()
+    const refs = [...html.matchAll(/ink-asset:\/\/local\/\?[^"'\s)]+/g)]
     for (const ref of refs) {
+      const src = ref[0]
+      if (seen.has(src)) continue
+      seen.add(src)
       try {
-        const file = decodeURIComponent(ref[1])
+        // 地址里可能同时有 p（相对文档目录）和 r（老的库根写法），取实际存在的那个
+        const u = new URL(src.replace(/&amp;/g, '&'))
+        const primary = u.searchParams.get('p') || ''
+        const fallback = u.searchParams.get('r') || ''
+        const file = existsSync(primary) ? primary : existsSync(fallback) ? fallback : primary
         const buf = await fsp.readFile(file)
         const ext = extname(file).slice(1).toLowerCase()
         const mime = ext === 'jpg' || ext === 'jpeg' ? 'jpeg' : ext === 'svg' ? 'svg+xml' : ext || 'png'
-        html = html.split(ref[0]).join(`data:image/${mime};base64,${buf.toString('base64')}`)
+        html = html.split(src).join(`data:image/${mime};base64,${buf.toString('base64')}`)
       } catch {
         /* 图片缺失时跳过 */
       }
@@ -1317,7 +1329,10 @@ if (!gotLock) {
     })
     protocol.handle('ink-asset', (request) => {
       const url = new URL(request.url)
-      const target = url.searchParams.get('p')
+      const primary = url.searchParams.get('p')
+      // r 是「按库根拼」的老写法候选：历史正文里的 assets/x.png 属于这种
+      const fallback = url.searchParams.get('r')
+      const target = primary && existsSync(primary) ? primary : fallback && existsSync(fallback) ? fallback : primary
       if (!target) return new Response('not found', { status: 404 })
       try {
         return net.fetch(pathToFileURL(target).toString())

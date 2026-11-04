@@ -70,7 +70,7 @@ const api = {
   clearClipboard: () => ipcRenderer.invoke('clipboard:clear'),
   removeClipboard: (id: string) => ipcRenderer.invoke('clipboard:remove', id),
 
-  saveAsset: (name: string, dataUrl: string) => ipcRenderer.invoke('asset:save', { name, dataUrl }),
+  saveAsset: (name: string, dataUrl: string, doc?: string) => ipcRenderer.invoke('asset:save', { name, dataUrl, doc }),
   exportHTML: (name: string, html: string) => ipcRenderer.invoke('export:html', { name, html }),
   openExternal: (url: string) => ipcRenderer.invoke('open:external', url),
 

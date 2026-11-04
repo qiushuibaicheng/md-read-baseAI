@@ -1,6 +1,6 @@
 import { promises as fsp } from 'fs'
 import { join, posix } from 'path'
-import type { InboundEdge } from './links'
+import type { InboundEdge, MoveSnapshot } from './links'
 
 /**
  * 移动/改名后的链接维护。
@@ -64,8 +64,42 @@ function relinkRaw(edge: InboundEdge, linkerNew: string, targetNew: string): str
   return next === oldRaw ? null : next
 }
 
-/** 把某一篇文件上的改动批量落盘，返回实际改成功的条目 */
-async function applyToFile(
+/**
+ * 文档自己挪了位置：正文里的相对路径要按新目录重算。
+ *
+ * 这和「改写指向移动目标的链接」是两件事——那是别人的引用，这是它自己的引用。
+ * 移动 `笔记/A.md` 到 `归档/`，A 里写的 `../资料/B.md` 就得变成 `../../资料/B.md`，
+ * 图片同理。只动相对写法；`/` 开头（库根）和外部链接与位置无关，不碰。
+ */
+function rebaseRaw(raw: string, oldRel: string, newRel: string): string | null {
+  if (!raw || raw.startsWith('/') || raw.startsWith('#')) return null
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return null
+
+  const encoded = /%[0-9a-f]{2}/i.test(raw)
+  let p = raw
+  try {
+    p = decodeURI(p)
+  } catch {
+    /* 编码不合法就按原文处理 */
+  }
+
+  const target = posix.normalize(posix.join(dirOf(oldRel), p))
+  // 指到库外面去了，没法算，保持原样
+  if (target.startsWith('..')) return null
+
+  let next = posix.relative(dirOf(newRel), target)
+  if (p.startsWith('./') && !next.startsWith('..')) next = `./${next}`
+  if (encoded) {
+    try {
+      next = encodeURI(next)
+    } catch {
+      /* 编码失败就保持明文 */
+    }
+  }
+  return next === raw ? null : next
+}
+
+/** 把某一篇文件上的改动批量落盘，返回实际改成功的条目 */async function applyToFile(
   root: string,
   rel: string,
   list: (RelinkChange & { col: number })[]
@@ -120,12 +154,12 @@ async function applyToFile(
  */
 export async function applyRelink(
   root: string,
-  snapshot: Map<string, InboundEdge[]>,
+  snapshot: MoveSnapshot,
   moves: Map<string, string>
 ): Promise<RelinkOutcome> {
   const byFile = new Map<string, (RelinkChange & { col: number })[]>()
 
-  for (const [oldTarget, edges] of snapshot) {
+  for (const [oldTarget, edges] of snapshot.inbound) {
     const targetNew = moves.get(oldTarget)
     if (!targetNew) continue
     for (const e of edges) {
@@ -137,6 +171,34 @@ export async function applyRelink(
       list.push({ path: linkerNew, line: e.line, col: e.col, from: e.raw, to })
       byFile.set(linkerNew, list)
     }
+  }
+
+  // 被移动的文档自己：正文里的相对路径（含图片）按新位置重算
+  for (const [oldRel, newRel] of moves) {
+    const refs = snapshot.raw.get(oldRel)
+    if (!refs?.length) continue
+    for (const r of refs) {
+      const to = rebaseRaw(r.raw, oldRel, newRel)
+      if (!to) continue
+      const list = byFile.get(newRel) || []
+      list.push({ path: newRel, line: r.line, col: r.col, from: r.raw, to })
+      byFile.set(newRel, list)
+    }
+  }
+
+  // 同一行的同一列只改一次：自己引用自己、或同时命中「入链改写」和「自身重算」时
+  // 会出现两条一模一样的改动，落两次会把路径改坏。
+  for (const [rel, list] of byFile) {
+    const seen = new Set<string>()
+    byFile.set(
+      rel,
+      list.filter((c) => {
+        const key = `${c.line}:${c.col}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+    )
   }
 
   const applied: RelinkChange[] = []

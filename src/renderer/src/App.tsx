@@ -937,9 +937,15 @@ export default function App() {
     return () => clearTimeout(timer)
   }, [activeContent, active])
 
+  /**
+   * 预览源文本。打字时预览本身有 130ms 防抖，这里必须跟着防抖走：
+   * 把 activeContent 直接塞进 useMemo 的依赖，等于每敲一个字都把整篇重新解析一遍，
+   * 上千行的文档光这一项就吃掉几十毫秒，而屏幕上根本不会有变化。
+   */
+  const previewSrc = preview.key === active ? preview.src : activeContent
   const rendered = useMemo(
-    () => (active ? renderMarkdown(preview.key === active ? preview.src : activeContent, config.vaultPath) : null),
-    [active, preview, activeContent, config.vaultPath]
+    () => (active ? renderMarkdown(previewSrc, config.vaultPath, active) : null),
+    [active, previewSrc, config.vaultPath]
   )
 
   const mode = config.editorMode
@@ -1337,7 +1343,7 @@ export default function App() {
     if (!file) return
     e.preventDefault()
     const dataUrl = await fileToDataUrl(file)
-    const rel = await window.api.saveAsset(file.name || 'image.png', dataUrl)
+    const rel = await window.api.saveAsset(file.name || 'image.png', dataUrl, active || undefined)
     insertAtCursor(`\n![](${rel})\n`)
     showToast('图片已插入')
   }

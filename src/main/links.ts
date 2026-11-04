@@ -88,6 +88,17 @@ interface RawEdge {
   image: boolean
 }
 
+/**
+ * 移动前的一份快照。
+ * inbound：谁引用了谁，移动后旧路径就解析不到了，得先抄下来。
+ * raw：每篇文档自己的原始引用（含图片），移动后要按新位置重算相对路径，
+ *      否则「文档自己引用的东西」会跟着一起断——移走一篇带图的笔记，图就找不到了。
+ */
+export interface MoveSnapshot {
+  inbound: Map<string, InboundEdge[]>
+  raw: Map<string, RawEdge[]>
+}
+
 interface DocEntry {
   path: string
   name: string
@@ -525,14 +536,20 @@ export class LinkIndex {
   }
 
   /**
-   * 入链快照。移动/改名会先取一份，因为移动完成后旧路径就解析不到了，
-   * 那些边会立刻退化成 broken，再想回头找「谁引用过它」就没机会了。
+   * 移动/改名前的快照。
+   *
+   * 入链：移动完成后旧路径就解析不到了，那些边会立刻退化成 broken，
+   * 再想回头找「谁引用过它」就没机会了。
+   * 自身引用：被移动的那篇正文里的相对路径（含图片）要按新位置重算，
+   * 而重算需要「移动前它是怎么写的」，同样过期不候。
    */
-  async snapshotInbound(): Promise<Map<string, InboundEdge[]>> {
+  async snapshotForMove(): Promise<MoveSnapshot> {
     await this.sync()
-    const out = new Map<string, InboundEdge[]>()
-    for (const [to, list] of this.inbound) out.set(to, list.slice())
-    return out
+    const inbound = new Map<string, InboundEdge[]>()
+    for (const [to, list] of this.inbound) inbound.set(to, list.slice())
+    const raw = new Map<string, RawEdge[]>()
+    for (const [path, doc] of this.docs) raw.set(path, doc.raw.map((r) => ({ ...r })))
+    return { inbound, raw }
   }
 
   /**
