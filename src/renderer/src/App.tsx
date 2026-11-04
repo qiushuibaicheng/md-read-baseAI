@@ -181,10 +181,14 @@ export default function App() {
   const caretRef = useRef<{ path: string; start: number; end: number } | null>(null)
   const saveTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
   const pending = useRef<Record<string, string>>({})
+  /** 最近一次读/写时磁盘上的 mtime：保存前拿它比对，能发现「别处改过」 */
+  const mtimes = useRef<Record<string, number>>({})
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const prevActive = useRef<string | null>(null)
   /** 事件回调里要用最新的 flushSave，避免闭包拿到首帧的配置 */
-  const flushRef = useRef<(path: string) => void>(() => undefined)
+  const flushRef = useRef<(path: string, opts?: { force?: boolean; create?: boolean }) => Promise<boolean>>(
+    async () => true
+  )
   const aiRef = useRef<AiPanelHandle | null>(null)
   const titledRef = useRef<Set<string>>(new Set())
 
@@ -240,20 +244,29 @@ export default function App() {
           arrived.push(...remapPaths(from, to))
         })
         // 旧路径上还有没落盘的内容：写到新位置，别让它随旧路径一起消失
-        arrived.forEach((p) => flushRef.current(p))
+        arrived.forEach((p) => void flushRef.current(p))
       }),
       // 撤销把正文改回原样了：编辑器里还是撤销前那份，重读一遍。
       // 不重读的话，用户随手改一个字触发自动保存，旧内容（链接已失效）又写回磁盘。
+      // 外部编辑器改过这篇时，主进程也走这条通道叫醒界面。
       window.api.onVaultRefreshed(async (info) => {
         for (const p of info.paths) {
           if (pending.current[p] !== undefined) continue
           try {
             const r = await window.api.readDoc(p)
+            // 重读之后基准时间戳也得跟着换，否则下一次保存会误判成冲突
+            mtimes.current[p] = r.mtime
             setContents((c) => (p in c ? { ...c, [p]: r.content } : c))
           } catch {
             /* 文档可能已经不在了 */
           }
         }
+      }),
+      // 退出前来一道落盘：自动保存的 600ms 窗口里写下的内容不能跟着窗口一起丢
+      window.api.onAppFlush(async () => {
+        const paths = Object.keys(pending.current)
+        await Promise.all(paths.map((p) => flushRef.current(p)))
+        window.api.flushDone()
       }),
       window.api.aiOnDocCreated(async () => {
         setDocs(await window.api.listDocs())
@@ -286,7 +299,10 @@ export default function App() {
     if (contents[active] !== undefined) return
     let cancelled = false
     window.api.readDoc(active).then((r) => {
-      if (!cancelled) setContents((c) => ({ ...c, [active]: r.content }))
+      if (!cancelled) {
+        mtimes.current[active] = r.mtime
+        setContents((c) => ({ ...c, [active]: r.content }))
+      }
     })
     return () => {
       cancelled = true
@@ -294,54 +310,118 @@ export default function App() {
   }, [active])
 
   // ---------------------------------------------------------------- 保存
-  const flushSave = useCallback(async (path: string) => {
-    const text = pending.current[path]
-    if (text === undefined) return
-    delete pending.current[path]
-    setSaving(true)
-    try {
-      await window.api.writeDoc(path, text)
-      setDirty((d) => ({ ...d, [path]: false }))
-      setDocs((prev) => prev.map((d) => (d.path === path ? { ...d, mtime: Date.now() } : d)))
+  /**
+   * 把一篇待存内容写到磁盘。返回 false 表示**没写成功**，调用方必须停下，
+   * 不能再接着做移动/改名——否则那段内容会跟着旧路径一起消失。
+   *
+   * 三种写不成的情况都不吞掉：
+   *  · missing  文件被外部删了 → 问「重新创建」还是「放弃这篇」，绝不偷偷重建
+   *  · conflict 别处改过（mtime 变了且内容不同）→ 问「保留我的」还是「用磁盘版本」
+   *  · 其它异常（磁盘满、被占用）→ 内容放回 pending，给一个「重试」
+   */
+  const flushSave = useCallback(
+    async (path: string, opts?: { force?: boolean; create?: boolean }): Promise<boolean> => {
+      const text = pending.current[path]
+      if (text === undefined) return true
+      delete pending.current[path]
+      setSaving(true)
+      try {
+        const res = await window.api.writeDoc(
+          path,
+          text,
+          opts ? opts : { baseMtime: mtimes.current[path] }
+        )
 
-      // AI 自动命名：只对仍是默认标题的新文档处理一次
-      const profileId = config.aiModelId
-      if (config.aiAutoTitle && profileId && !titledRef.current.has(path) && /^#\s*未命名/.test(text.trim())) {
-        titledRef.current.add(path)
-        const title = await window.api.aiTitle({ profileId, content: text })
-        if (title) {
-          const rel = await window.api.renameDoc(path, title)
-          setTabs((t) => t.map((p) => (p === path ? rel : p)))
-          setContents((c) => {
-            if (c[path] === undefined) return c
-            const next = { ...c }
-            next[rel] = next[path]
-            delete next[path]
-            return next
-          })
-          setActive((a) => (a === path ? rel : a))
-          setDocs(await window.api.listDocs())
-          showToast(`已命名为「${title}」`)
+        if (!res.ok) {
+          // 没写成：内容放回 pending，一个字都不丢
+          pending.current[path] = text
+          setDirty((d) => ({ ...d, [path]: true }))
+
+          if (res.missing) {
+            showToast('这篇已经不在磁盘上了', true, [
+              { label: '重新创建', run: () => void flushSave(path, { create: true, force: true }) },
+              {
+                label: '放弃这篇',
+                run: () => {
+                  delete pending.current[path]
+                  setDirty((d) => ({ ...d, [path]: false }))
+                  setTabs((t) => t.filter((p) => p !== path))
+                  setActive((a) => (a === path ? null : a))
+                  showToast('已丢弃内存里的这份内容')
+                }
+              }
+            ])
+            return false
+          }
+
+          if (res.conflict) {
+            const disk = res.disk ?? ''
+            showToast('这篇在别处被改过，没有覆盖', true, [
+              { label: '保留我的', run: () => void flushSave(path, { force: true }) },
+              {
+                label: '用磁盘版本',
+                run: () => {
+                  delete pending.current[path]
+                  mtimes.current[path] = res.mtime ?? 0
+                  setContents((c) => ({ ...c, [path]: disk }))
+                  setDirty((d) => ({ ...d, [path]: false }))
+                  showToast('已换成磁盘上的版本')
+                }
+              }
+            ])
+            return false
+          }
+          return false
         }
+
+        mtimes.current[path] = res.mtime
+        setDirty((d) => ({ ...d, [path]: false }))
+        setDocs((prev) => prev.map((d) => (d.path === path ? { ...d, mtime: Date.now() } : d)))
+
+        // AI 自动命名：只对仍是默认标题的新文档处理一次
+        const profileId = config.aiModelId
+        if (config.aiAutoTitle && profileId && !titledRef.current.has(path) && /^#\s*未命名/.test(text.trim())) {
+          titledRef.current.add(path)
+          const title = await window.api.aiTitle({ profileId, content: text })
+          if (title) {
+            const rel = await window.api.renameDoc(path, title)
+            setTabs((t) => t.map((p) => (p === path ? rel : p)))
+            setContents((c) => {
+              if (c[path] === undefined) return c
+              const next = { ...c }
+              next[rel] = next[path]
+              delete next[path]
+              return next
+            })
+            setActive((a) => (a === path ? rel : a))
+            setDocs(await window.api.listDocs())
+            showToast(`已命名为「${title}」`)
+          }
+        }
+        return true
+      } catch (err) {
+        pending.current[path] = text
+        setDirty((d) => ({ ...d, [path]: true }))
+        showToast(`保存失败：${errText(err)}`, true, [{ label: '重试', run: () => void flushSave(path) }])
+        return false
+      } finally {
+        setSaving(false)
       }
-    } finally {
-      setSaving(false)
-    }
-  }, [config.aiModelId, config.aiAutoTitle])
+    },
+    [config.aiModelId, config.aiAutoTitle]
+  )
 
   useEffect(() => {
-    flushRef.current = (path: string) => {
-      void flushSave(path)
-    }
+    flushRef.current = (path: string, opts?: { force?: boolean; create?: boolean }) => flushSave(path, opts)
   }, [flushSave])
 
   useEffect(() => {
-    if (prevActive.current && prevActive.current !== active) flushSave(prevActive.current)
+    if (prevActive.current && prevActive.current !== active) void flushSave(prevActive.current)
     prevActive.current = active
   }, [active, flushSave])
 
   useEffect(() => {
-    const onBlur = () => Object.keys(pending.current).forEach((p) => flushSave(p))
+    const onBlur = () => Object.keys(pending.current).forEach((p) => void flushSave(p))
     window.addEventListener('blur', onBlur)
     return () => window.removeEventListener('blur', onBlur)
   }, [flushSave])
@@ -352,7 +432,7 @@ export default function App() {
     setDirty((d) => ({ ...d, [active]: true }))
     pending.current[active] = text
     clearTimeout(saveTimers.current[active])
-    saveTimers.current[active] = setTimeout(() => flushSave(active), 600)
+    saveTimers.current[active] = setTimeout(() => void flushSave(active), 600)
   }
 
   // ---------------------------------------------------------------- 链接图
@@ -652,6 +732,14 @@ export default function App() {
     })
     // 待存内容跟着搬；返回搬到了哪些新路径，调用方据此决定要不要立刻落盘
     const arrived: string[] = []
+    // 基准时间戳也搬过去，否则新路径第一次保存会因为「没有基准」而漏掉冲突检测
+    Object.keys(mtimes.current).forEach((k) => {
+      const nk = map(k)
+      if (nk !== k) {
+        mtimes.current[nk] = mtimes.current[k]
+        delete mtimes.current[k]
+      }
+    })
     Object.keys(pending.current).forEach((k) => {
       const nk = map(k)
       if (nk !== k) {
@@ -670,7 +758,10 @@ export default function App() {
   /** 拖拽落位：跨目录移动 + 手动排序，一次请求搞定，避免拖完顺序又被打回字母序 */
   const arrangeEntry = async (payload: { kind: 'doc' | 'dir'; path: string; targetDir: string; index: number }) => {
     try {
-      if (payload.kind === 'doc' && pending.current[payload.path] !== undefined) await flushSave(payload.path)
+      if (payload.kind === 'doc' && pending.current[payload.path] !== undefined) {
+        // 存不下去就别搬：搬完这段内容会跟着旧路径一起消失
+        if (!(await flushSave(payload.path))) return
+      }
       const res = await window.api.arrange(payload)
       if (res.rel !== payload.path) {
         remapPaths(payload.path, res.rel)
@@ -692,7 +783,9 @@ export default function App() {
       return
     }
     try {
-      if (pending.current[path] !== undefined) await flushSave(path)
+      if (pending.current[path] !== undefined) {
+        if (!(await flushSave(path))) return
+      }
       const rel = await window.api.moveDoc(path, dir)
       remapPaths(path, rel)
       setDocs(await window.api.listDocs())
@@ -912,7 +1005,9 @@ export default function App() {
     const w = writes.find((x) => x.id === id)
     if (!w) return
     // 编辑器里可能有没落盘的改动：先 flush，再比对，避免覆盖用户正在写的内容
-    if (pending.current[w.path] !== undefined) await flushSave(w.path)
+    if (pending.current[w.path] !== undefined) {
+      if (!(await flushSave(w.path))) return
+    }
     const inMemory = contents[w.path]
     if (inMemory !== undefined && inMemory !== w.before) {
       await window.api.aiDiscardWrite(id)
@@ -1097,7 +1192,7 @@ export default function App() {
 
   // ---------------------------------------------------------------- 快捷键
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
+    const onKey = async (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey
       const key = e.key.toLowerCase()
 
@@ -1121,8 +1216,9 @@ export default function App() {
       }
       if (mod && key === 's') {
         e.preventDefault()
-        if (active) flushSave(active)
-        showToast('已保存')
+        if (!active) return
+        // 存不下就别报「已保存」：上面已经弹过具体原因了
+        if (await flushSave(active)) showToast('已保存')
         return
       }
       if (mod && key === 'e') {

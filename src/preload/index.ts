@@ -22,7 +22,11 @@ const api = {
   pickVault: () => ipcRenderer.invoke('vault:pick'),
   vaultPath: () => ipcRenderer.invoke('vault:path'),
   readDoc: (rel: string) => ipcRenderer.invoke('doc:read', rel),
-  writeDoc: (rel: string, content: string) => ipcRenderer.invoke('doc:write', rel, content),
+  writeDoc: (
+    rel: string,
+    content: string,
+    opts?: { baseMtime?: number; force?: boolean; create?: boolean }
+  ) => ipcRenderer.invoke('doc:write', rel, content, opts),
   createDoc: (payload: { dir?: string; title?: string }) => ipcRenderer.invoke('doc:create', payload),
   renameDoc: (rel: string, name: string) => ipcRenderer.invoke('doc:rename', rel, name),
   deleteDoc: (rel: string) => ipcRenderer.invoke('doc:delete', rel),
@@ -109,6 +113,9 @@ const api = {
   onMaximized: (cb: (on: boolean) => void) => on('window:maximized', cb),
   onOpenSettings: (cb: () => void) => on('ui:open-settings', cb),
   onThemeSystem: (cb: (dark: boolean) => void) => on('theme:system', cb),
+  /** 退出前主进程要求把待保存内容落盘，写完调 flushDone */
+  onAppFlush: (cb: () => void) => on('app:flush', cb),
+  flushDone: () => ipcRenderer.send('app:flush-done'),
 
   aiOnStream: (cb: (data: { reqId: string; text: string; reasoning: string }) => void) => on('ai:stream', cb),
   aiOnDone: (cb: (data: { reqId: string; text: string; reasoning: string; usage?: { prompt: number; completion: number } }) => void) =>

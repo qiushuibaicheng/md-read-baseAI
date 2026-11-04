@@ -626,6 +626,12 @@ let win: BrowserWindow | null = null
 let tray: Tray | null = null
 let suppressBlurHide = false
 let isQuitting = false
+/** 退出流程是否已经等过一次落盘：防止 app.quit() 再次触发 before-quit 时又挂起 */
+let quitFlushed = false
+/** 渲染层回「写完了」之后的收尾动作 */
+let flushWaiter: (() => void) | null = null
+/** 刚由界面写下的路径：监听回调要放过它们，别把「自己保存」当成「外部改动」 */
+const recentlyWritten = new Map<string, number>()
 
 function toggleWindow() {
   if (!win) return
@@ -901,15 +907,47 @@ function setupIPC() {
     return { content, mtime: (await fsp.stat(abs)).mtimeMs }
   })
 
-  ipcMain.handle('doc:write', async (_e, rel: string, content: string) => {
-    const abs = safePath(rel)
-    await fsp.mkdir(dirname(abs), { recursive: true })
-    await fsp.writeFile(abs, content, 'utf-8')
-    // 不等目录监听的 600ms 防抖：保存完立刻问 AI「这篇引用了谁」时，
-    // 拿到的应该是刚写下的链接图，而不是上一版。
-    linkIndex.invalidate(rel)
-    return true
-  })
+  ipcMain.handle(
+    'doc:write',
+    async (
+      _e,
+      rel: string,
+      content: string,
+      opts: { baseMtime?: number; force?: boolean; create?: boolean } = {}
+    ): Promise<{ ok: true; mtime: number } | { ok: false; missing?: true; conflict?: true; mtime?: number; disk?: string }> => {
+      const abs = safePath(rel)
+
+      // 文件被外部删掉了（资源管理器、同步盘）：不要 mkdir + writeFile 把它悄悄重建。
+      // 重建出来的只是当前缓冲区这一份，磁盘上原来那篇已经没了，用户会以为「文件自己回来了」。
+      if (!existsSync(abs)) {
+        if (!opts.create) return { ok: false, missing: true }
+        await fsp.mkdir(dirname(abs), { recursive: true })
+      }
+
+      const before = existsSync(abs) ? await fsp.stat(abs) : null
+
+      // 别处（另一个编辑器、同步盘、我自己的 AI 写入）改过这篇：默认不覆盖。
+      // 只比 mtime 不够——有些文件系统精度只到 2 秒，所以内容不同才算真冲突。
+      if (!opts.force && before && typeof opts.baseMtime === 'number' && opts.baseMtime > 0) {
+        if (Math.abs(before.mtimeMs - opts.baseMtime) > 1) {
+          const disk = await fsp.readFile(abs, 'utf-8')
+          if (disk !== content) return { ok: false, conflict: true, mtime: before.mtimeMs, disk }
+        }
+      }
+
+      await fsp.writeFile(abs, content, 'utf-8')
+      // 不等目录监听的 600ms 防抖：保存完立刻问 AI「这篇引用了谁」时，
+      // 拿到的应该是刚写下的链接图，而不是上一版。
+      linkIndex.invalidate(rel)
+      const mtime = (await fsp.stat(abs)).mtimeMs
+      // 自己写下的不算「外部改动」，否则每次保存都会让界面重读一遍正文
+      recentlyWritten.set(rel, Date.now())
+      if (recentlyWritten.size > 500) {
+        for (const [k, t] of recentlyWritten) if (Date.now() - t > 60_000) recentlyWritten.delete(k)
+      }
+      return { ok: true, mtime }
+    }
+  )
 
   ipcMain.handle('doc:create', async (_e, payload: { dir?: string; title?: string } = {}) => {
     const dirAbs = payload.dir ? safePath(payload.dir) : config.vaultPath
@@ -923,6 +961,7 @@ function setupIPC() {
     const rel = relative(config.vaultPath, abs).split('\\').join('/')
     unshiftOrder(payload.dir || '', rel)
     linkIndex.invalidate(rel)
+    recentlyWritten.set(rel, Date.now())
     return rel
   })
 
@@ -930,6 +969,14 @@ function setupIPC() {
     const abs = safePath(rel)
     const clean = nextName.replace(/[\\/:*?"<>|]/g, '').trim() || '未命名'
     const nextAbs = join(dirname(abs), clean.endsWith('.md') ? clean : `${clean}.md`)
+
+    // 目标已存在就先拦住。Windows 上 fsp.rename 会直接覆盖，同名那篇连同它的正文一起消失，
+    // 而撤销栈里没有「删除」这一档，救不回来。
+    // 只改大小写（a.md → A.md）不算冲突：大小写不敏感的文件系统里 existsSync 会命中自己。
+    if (nextAbs.toLowerCase() !== abs.toLowerCase() && existsSync(nextAbs)) {
+      throw new Error(`已存在「${basename(nextAbs)}」，换个名字或先把它移走`)
+    }
+
     const snapshot = await linkIndex.snapshotInbound()
     await fsp.rename(abs, nextAbs)
     const next = relative(config.vaultPath, nextAbs).split('\\').join('/')
@@ -1119,6 +1166,8 @@ function setupIPC() {
     isQuitting = true
     app.quit()
   })
+  // 渲染层把待保存内容落盘完毕（或放弃），退出流程继续
+  ipcMain.on('app:flush-done', () => flushWaiter?.())
   ipcMain.handle('app:version', () => app.getVersion())
   ipcMain.handle('app:openVault', () => shell.openPath(config.vaultPath))
   ipcMain.handle('app:isPackaged', () => app.isPackaged)
@@ -1177,6 +1226,16 @@ function startVaultWatch() {
         if (!win) return
         win.webContents.send('vault:changed', await scanVault())
         win.webContents.send('links:changed')
+
+        // 别的编辑器 / 同步盘改了正文：打开着的这篇得重读一遍，
+        // 否则界面停在旧内容上，下一次自动保存还会把旧内容写回去。
+        // 排除刚由自己写下的（recentlyWritten），那属于回音，不是改动。
+        const now = Date.now()
+        const touched = paths.filter((p) => {
+          if (!/\.(md|markdown|mdx)$/i.test(p)) return false
+          return now - (recentlyWritten.get(p) ?? 0) > 1500
+        })
+        if (touched.length) win.webContents.send('vault:refreshed', { paths: touched })
       }, 600)
     })
     watcher.on('error', (err) => {
@@ -1322,8 +1381,24 @@ if (!gotLock) {
     })
   })
 
-  app.on('before-quit', () => {
+  app.on('before-quit', (e) => {
     isQuitting = true
+    // 自动保存有 600ms 窗口：打完最后一句话直接「退出」，这段话还没落盘。
+    // 先让渲染层把 pending 写完再退；窗口已经没了就直接走。
+    if (quitFlushed || !win || win.webContents.isDestroyed()) return
+    e.preventDefault()
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      quitFlushed = true
+      flushWaiter = null
+      clearTimeout(timer)
+      app.quit()
+    }
+    const timer = setTimeout(finish, 2500)
+    flushWaiter = finish
+    win.webContents.send('app:flush')
   })
 
   app.on('window-all-closed', () => {

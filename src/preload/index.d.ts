@@ -212,7 +212,17 @@ export interface InkAPI {
   pickVault(): Promise<{ config: AppConfig; docs: DocMeta[] } | null>
   vaultPath(): Promise<string>
   readDoc(rel: string): Promise<{ content: string; mtime: number }>
-  writeDoc(rel: string, content: string): Promise<boolean>
+  /**
+   * 保存正文。带 baseMtime 时，若磁盘上的 mtime 已变且内容不同，不写并返回 conflict；
+   * 文件被外部删掉时返回 missing（除非显式 create）。
+   */
+  writeDoc(
+    rel: string,
+    content: string,
+    opts?: { baseMtime?: number; force?: boolean; create?: boolean }
+  ): Promise<
+    { ok: true; mtime: number } | { ok: false; missing?: true; conflict?: true; mtime?: number; disk?: string }
+  >
   createDoc(payload: { dir?: string; title?: string }): Promise<string>
   renameDoc(rel: string, name: string): Promise<string>
   deleteDoc(rel: string): Promise<boolean>
@@ -309,6 +319,9 @@ export interface InkAPI {
   onMaximized(cb: (on: boolean) => void): () => void
   onOpenSettings(cb: () => void): () => void
   onThemeSystem(cb: (dark: boolean) => void): () => void
+  /** 退出前要求把待保存内容落盘；写完必须调 flushDone，否则主进程等 2.5s 后强退 */
+  onAppFlush(cb: () => void): () => void
+  flushDone(): void
   aiOnStream(cb: (d: { reqId: string; text: string; reasoning: string }) => void): () => void
   aiOnDone(
     cb: (d: { reqId: string; text: string; reasoning: string; usage?: { prompt: number; completion: number }; plan?: PlanStep[] }) => void
